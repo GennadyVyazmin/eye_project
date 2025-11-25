@@ -325,7 +325,7 @@ def main():
     )
 
     # Если нужно начать с чистого листа, раскомментируйте:
-     counter.cleanup_database()
+    counter.cleanup_database()
 
     try:
         counter.start_analysis(0)
