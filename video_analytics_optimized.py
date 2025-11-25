@@ -320,8 +320,8 @@ def main():
 
     # Создаем счетчик с высоким порогом схожести
     counter = VisitorCounter(
-        processing_interval=1.0,
-        similarity_threshold=0.15  # Высокий порог для избежания дубликатов
+        processing_interval=0.5,
+        similarity_threshold=0.10  # Высокий порог для избежания дубликатов
     )
 
     # Если нужно начать с чистого листа, раскомментируйте:
