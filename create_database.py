@@ -30,6 +30,7 @@ def create_database():
 
     conn.commit()
     conn.close()
+    print("База данных успешно создана!")
 
 
 if __name__ == "__main__":
