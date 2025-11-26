@@ -1,36 +1,42 @@
-# video_analytics_trassir.py
+# video_analytics_trassir_optimized.py
 import cv2
 import numpy as np
 import sqlite3
 import datetime
 import time
 from deepface import DeepFace
-from collections import defaultdict
 import logging
-import os
+import threading
+from queue import Queue
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-class TrassirVisitorCounter:
-    def __init__(self, processing_interval=0.3, similarity_threshold=0.65):
+class OptimizedTrassirCounter:
+    def __init__(self, processing_interval=1.0, similarity_threshold=0.65):
         """
-        Инициализация счетчика посетителей для камеры Trassir
+        Оптимизированная версия для снижения нагрузки на ЦП
         """
-        self.conn = sqlite3.connect('visitors_trassir.db', check_same_thread=False)
+        self.conn = sqlite3.connect('visitors_trassir_opt.db', check_same_thread=False)
         self._init_database()
 
         self.processing_interval = processing_interval
-        self.similarity_threshold = similarity_threshold  # Высокий порог для качественной камеры
+        self.similarity_threshold = similarity_threshold
 
         # Трекинг состояния
         self.last_processing_time = 0
         self.known_visitors_cache = {}
         self.frame_count = 0
+        self.last_frame = None
+        self.processing_active = False
 
-        # Загрузка детектора лиц - используем более точный детектор
+        # Очередь для асинхронной обработки
+        self.frame_queue = Queue(maxsize=2)  # Ограничиваем очередь
+        self.results_queue = Queue()
+
+        # Загрузка детектора лиц
         self.face_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
         )
@@ -38,12 +44,15 @@ class TrassirVisitorCounter:
         # Предзагрузка известных посетителей
         self._load_known_visitors()
 
-        logger.info(f"Инициализация для Trassir завершена. Порог схожести: {similarity_threshold}")
+        # Поток для обработки
+        self.processing_thread = None
+        self.stop_processing = False
+
+        logger.info(f"Оптимизированная инициализация завершена. Интервал: {processing_interval}с")
 
     def _init_database(self):
         """Инициализация базы данных"""
         cursor = self.conn.cursor()
-
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS visitors (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,24 +60,10 @@ class TrassirVisitorCounter:
                 first_seen TIMESTAMP,
                 last_seen TIMESTAMP,
                 visit_count INTEGER DEFAULT 1,
-                last_updated TIMESTAMP,
-                quality_score REAL DEFAULT 1.0
+                last_updated TIMESTAMP
             )
         ''')
-
-        # Таблица для статистики по камере
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS camera_stats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TIMESTAMP,
-                total_detections INTEGER,
-                unique_visitors INTEGER,
-                frame_quality REAL
-            )
-        ''')
-
         self.conn.commit()
-        logger.info("База данных Trassir инициализирована")
 
     def _load_known_visitors(self):
         """Загрузка известных посетителей в кэш"""
@@ -77,349 +72,316 @@ class TrassirVisitorCounter:
         visitors = cursor.fetchall()
 
         self.known_visitors_cache.clear()
-        loaded_count = 0
-
         for visitor_id, embedding_blob in visitors:
             if embedding_blob:
                 try:
                     embedding = np.frombuffer(embedding_blob, dtype=np.float64)
                     self.known_visitors_cache[visitor_id] = embedding
-                    loaded_count += 1
                 except Exception as e:
                     logger.warning(f"Ошибка загрузки посетителя {visitor_id}: {e}")
 
-        logger.info(f"Загружено посетителей в кэш: {loaded_count}")
+    def start_processing_thread(self):
+        """Запуск фонового потока обработки"""
+        self.stop_processing = False
+        self.processing_thread = threading.Thread(target=self._processing_worker, daemon=True)
+        self.processing_thread.start()
+        logger.info("Фоновый поток обработки запущен")
 
-    def calculate_frame_quality(self, frame):
-        """Оценка качества кадра для Trassir"""
+    def _processing_worker(self):
+        """Фоновая обработка кадров"""
+        while not self.stop_processing:
+            try:
+                # Берем кадр из очереди с таймаутом
+                frame_data = self.frame_queue.get(timeout=1.0)
+                frame, frame_time = frame_data
+
+                # Обработка кадра
+                result = self._process_frame_heavy(frame)
+                self.results_queue.put((result, frame_time))
+
+                self.frame_queue.task_done()
+
+            except:
+                continue
+
+    def _process_frame_heavy(self, frame):
+        """Тяжелые операции обработки (выполняются в фоне)"""
         try:
-            # Проверка резкости через лапласиан
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+            # Сильно уменьшаем разрешение для обработки
+            height, width = frame.shape[:2]
+            if width > 640:  # Уменьшаем до 640px для обработки
+                scale = 640 / width
+                new_width = 640
+                new_height = int(height * scale)
+                frame_small = cv2.resize(frame, (new_width, new_height))
+            else:
+                frame_small = frame
 
-            # Проверка яркости
-            brightness = np.mean(gray)
-
-            # Проверка контраста
-            contrast = np.std(gray)
-
-            quality_score = min(1.0, laplacian_var / 1000.0)  # Нормализация
-
-            return quality_score
-        except:
-            return 0.5
-
-    def get_face_embedding(self, face_image):
-        """Получение эмбеддинга лица с улучшенной обработкой для Trassir"""
-        try:
-            # Увеличиваем размер для использования деталей высокого разрешения
-            face_resized = cv2.resize(face_image, (224, 224))
-
-            # Улучшенная предобработка для профессиональной камеры
-            face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
-
-            # Улучшение контраста и яркости
-            lab = cv2.cvtColor(face_rgb, cv2.COLOR_RGB2LAB)
-            l, a, b = cv2.split(lab)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            l_enhanced = clahe.apply(l)
-            lab_enhanced = cv2.merge([l_enhanced, a, b])
-            face_enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2RGB)
-
-            result = DeepFace.represent(
-                face_enhanced,
-                model_name='Facenet',
-                enforce_detection=False,
-                detector_backend='opencv'
+            # Детекция лиц на уменьшенном кадре
+            gray = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY)
+            faces = self.face_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(40, 40),
+                flags=cv2.CASCADE_SCALE_IMAGE
             )
 
-            return np.array(result[0]['embedding'], dtype=np.float64)
+            processed_faces = []
+            if len(faces) > 0:
+                for (x, y, w, h) in faces:
+                    # Масштабируем координаты обратно
+                    scale_x = width / frame_small.shape[1]
+                    scale_y = height / frame_small.shape[0]
+
+                    x_orig = int(x * scale_x)
+                    y_orig = int(y * scale_y)
+                    w_orig = int(w * scale_x)
+                    h_orig = int(h * scale_y)
+
+                    if 50 <= w_orig <= 400 and 50 <= h_orig <= 400:
+                        face_img = frame[y_orig:y_orig + h_orig, x_orig:x_orig + w_orig]
+
+                        # Получаем эмбеддинг только для хороших лиц
+                        embedding = self.get_fast_embedding(face_img)
+                        if embedding is not None:
+                            processed_faces.append({
+                                'coords': (x_orig, y_orig, w_orig, h_orig),
+                                'embedding': embedding
+                            })
+
+            return {
+                'faces': processed_faces,
+                'processed_count': len(processed_faces),
+                'detected_count': len(faces)
+            }
 
         except Exception as e:
-            logger.warning(f"Ошибка получения эмбеддинга: {e}")
+            logger.error(f"Ошибка в фоновой обработке: {e}")
+            return {'faces': [], 'processed_count': 0, 'detected_count': 0}
+
+    def get_fast_embedding(self, face_image):
+        """Быстрое получение эмбеддинга с оптимизацией"""
+        try:
+            # Сильное уменьшение для скорости
+            face_resized = cv2.resize(face_image, (96, 96))  # Было 224x224
+
+            # Минимальная предобработка
+            face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
+
+            result = DeepFace.represent(
+                face_rgb,
+                model_name='Facenet',  # Можно попробовать 'OpenFace' для скорости
+                enforce_detection=False,
+                detector_backend='skip',  # Пропускаем детекцию, т.к. уже есть лица
+                align=False
+            )
+
+            return np.array(result[0]['embedding'], dtype=np.float32)  # float32 вместо float64
+
+        except Exception as e:
             return None
 
     def calculate_similarity(self, embedding1, embedding2):
-        """Расчет схожести между эмбеддингами"""
+        """Быстрый расчет схожести"""
         if embedding1 is None or embedding2 is None:
             return 0.0
 
         try:
             emb1_norm = embedding1 / np.linalg.norm(embedding1)
             emb2_norm = embedding2 / np.linalg.norm(embedding2)
-            similarity = np.dot(emb1_norm, emb2_norm)
-            return float(similarity)
-        except Exception as e:
-            logger.warning(f"Ошибка расчета схожести: {e}")
+            return float(np.dot(emb1_norm, emb2_norm))
+        except:
             return 0.0
 
     def find_best_match(self, embedding):
-        """Поиск лучшего совпадения среди известных посетителей"""
+        """Поиск лучшего совпадения"""
         best_match_id = None
         best_similarity = 0.0
 
         for visitor_id, known_embedding in self.known_visitors_cache.items():
             similarity = self.calculate_similarity(embedding, known_embedding)
-
             if similarity > best_similarity:
                 best_similarity = similarity
                 best_match_id = visitor_id
 
         return best_match_id, best_similarity
 
-    def save_visitor(self, embedding, quality_score=1.0):
-        """Сохранение или обновление информации о посетителе"""
+    def save_visitor(self, embedding):
+        """Сохранение посетителя"""
         cursor = self.conn.cursor()
         now = datetime.datetime.now()
 
         visitor_id, similarity = self.find_best_match(embedding)
 
         if similarity > self.similarity_threshold:
-            # Обновление существующего посетителя
             cursor.execute(
-                """UPDATE visitors SET last_seen = ?, visit_count = visit_count + 1, 
-                   last_updated = ?, quality_score = ? WHERE id = ?""",
-                (now, now, quality_score, visitor_id)
+                "UPDATE visitors SET last_seen = ?, visit_count = visit_count + 1 WHERE id = ?",
+                (now, visitor_id)
             )
-            self.known_visitors_cache[visitor_id] = embedding
-            logger.info(f"🔄 ОБНОВЛЕН посетитель {visitor_id}, схожесть: {similarity:.3f}")
-
+            logger.debug(f"Обновлен посетитель {visitor_id}")
         else:
-            # Добавление нового посетителя
-            embedding_blob = embedding.tobytes()
+            embedding_blob = embedding.astype(np.float32).tobytes()
             cursor.execute(
-                """INSERT INTO visitors (face_embedding, first_seen, last_seen, 
-                   visit_count, last_updated, quality_score) VALUES (?, ?, ?, 1, ?, ?)""",
-                (embedding_blob, now, now, now, quality_score)
+                "INSERT INTO visitors (face_embedding, first_seen, last_seen, visit_count) VALUES (?, ?, ?, 1)",
+                (embedding_blob, now, now)
             )
             visitor_id = cursor.lastrowid
             self.known_visitors_cache[visitor_id] = embedding
-            logger.info(f"🆕 НОВЫЙ посетитель {visitor_id}, схожесть: {similarity:.3f}")
+            logger.info(f"🆕 НОВЫЙ посетитель {visitor_id}")
 
         self.conn.commit()
         return visitor_id
 
-    def _process_multiple_faces(self, face_data, processed_frame, frame_quality):
-        """Обработка нескольких лиц для Trassir"""
-        processed_count = 0
-        embeddings_cache = {}
-
-        # Получаем эмбеддинги для всех лиц
-        for i, (x, y, w, h, face_img) in enumerate(face_data):
-            try:
-                embedding = self.get_face_embedding(face_img)
-                if embedding is not None:
-                    embeddings_cache[i] = (x, y, w, h, embedding)
-            except Exception as e:
-                logger.warning(f"Ошибка получения эмбеддинга: {e}")
-
-        # Обработка с проверкой дубликатов
-        processed_embeddings = []
-
-        for i, (x, y, w, h, embedding) in embeddings_cache.items():
-            # Проверка на дубликаты в текущем кадре
-            is_duplicate_in_frame = False
-            for existing_embedding in processed_embeddings:
-                if self.calculate_similarity(embedding, existing_embedding) > 0.8:
-                    is_duplicate_in_frame = True
-                    break
-
-            if not is_duplicate_in_frame:
-                visitor_id = self.save_visitor(embedding, frame_quality)
-                processed_embeddings.append(embedding)
-                processed_count += 1
-
-                # Определяем цвет рамки
-                best_match_id, similarity = self.find_best_match(embedding)
-                is_new = similarity <= self.similarity_threshold
-
-                color = (0, 0, 255) if is_new else (0, 255, 0)
-                status = "NEW" if is_new else "KNOWN"
-
-                # Отрисовка с улучшенной визуализацией
-                cv2.rectangle(processed_frame, (x, y), (x + w, y + h), color, 3)
-                cv2.putText(processed_frame, f'{status}: {visitor_id}', (x, y - 15),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                cv2.putText(processed_frame, f'Visits: {self.get_visit_count(visitor_id)}',
-                            (x, y + h + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-                cv2.putText(processed_frame, f'Sim: {similarity:.2f}',
-                            (x, y + h + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-
-        return processed_count
-
-    def process_frame(self, frame):
-        """Обработка кадра для Trassir с оптимизацией под высокое разрешение"""
-        current_time = time.time()
-
-        if current_time - self.last_processing_time < self.processing_interval:
-            return frame, 0, 0, 0.0
-
-        # Оценка качества кадра
-        frame_quality = self.calculate_frame_quality(frame)
-
-        # Ресайз для ускорения обработки (сохраняя детализацию)
-        height, width = frame.shape[:2]
-        if width > 1920:
-            scale = 1920 / width
-            new_width = 1920
-            new_height = int(height * scale)
-            frame_resized = cv2.resize(frame, (new_width, new_height))
-        else:
-            frame_resized = frame
-
-        # Детекция лиц с оптимизированными параметрами для Trassir
-        gray = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
-        faces = self.face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.05,  # Более точный поиск
-            minNeighbors=8,  # Меньше ложных срабатываний
-            minSize=(80, 80),  # Больший минимальный размер
-            maxSize=(400, 400),  # Ограничение для крупных планов
-            flags=cv2.CASCADE_SCALE_IMAGE
-        )
-
-        detected_count = len(faces)
-        processed_count = 0
-
-        if detected_count > 0:
-            processed_frame = frame_resized.copy()
-            face_data = []
-
-            # Масштабируем координаты обратно если делали ресайз
-            scale_x = width / processed_frame.shape[1]
-            scale_y = height / processed_frame.shape[0]
-
-            for (x, y, w, h) in faces:
-                # Корректировка координат для исходного размера
-                x_orig = int(x * scale_x)
-                y_orig = int(y * scale_y)
-                w_orig = int(w * scale_x)
-                h_orig = int(h * scale_y)
-
-                if w_orig < 60 or h_orig < 60 or w_orig > 500 or h_orig > 500:
-                    continue
-
-                face_img = frame[y_orig:y_orig + h_orig, x_orig:x_orig + w_orig]
-                face_data.append((x_orig, y_orig, w_orig, h_orig, face_img))
-
-            # Обрабатываем все лица
-            processed_count = self._process_multiple_faces(face_data, processed_frame, frame_quality)
-
-            self.last_processing_time = current_time
-            self.frame_count += 1
-
-            logger.info(
-                f"Кадр {self.frame_count}: Обнаружено: {detected_count}, Обработано: {processed_count}, Качество: {frame_quality:.2f}")
-            return processed_frame, detected_count, processed_count, frame_quality
-
-        return frame, 0, 0, frame_quality
-
-    def get_visit_count(self, visitor_id):
-        """Получение количества визитов посетителя"""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT visit_count FROM visitors WHERE id = ?", (visitor_id,))
-        result = cursor.fetchone()
-        return result[0] if result else 1
-
     def setup_rtsp_camera(self, rtsp_url):
-        """Настройка подключения к RTSP камере Trassir"""
+        """Настройка RTSP с оптимизацией"""
         cap = cv2.VideoCapture(rtsp_url)
 
-        # Настройки для RTPS потока
+        # ОПТИМИЗАЦИЯ: Уменьшаем качество потока для предпросмотра
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        cap.set(cv2.CAP_PROP_FPS, 15)
+        cap.set(cv2.CAP_PROP_FPS, 10)  # Ограничиваем FPS
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'H264'))
 
-        # Даем камере время на инициализацию
-        time.sleep(2)
+        # Пропускаем первые несколько кадров для стабилизации
+        for _ in range(10):
+            cap.read()
 
         return cap
 
+    def process_frame_realtime(self, frame):
+        """Обработка кадра в реальном времени (только отрисовка)"""
+        current_time = time.time()
+
+        # Обрабатываем только каждый N-ый кадр
+        if current_time - self.last_processing_time < self.processing_interval:
+            # Но проверяем есть ли результаты от фоновой обработки
+            try:
+                result, frame_time = self.results_queue.get_nowait()
+                self._apply_processing_result(frame, result)
+            except:
+                pass
+            return frame, 0, 0
+
+        # Отправляем кадр в фоновую обработку
+        if self.frame_queue.qsize() < 2:  # Не перегружаем очередь
+            self.frame_queue.put((frame.copy(), current_time))
+
+        self.last_processing_time = current_time
+
+        # Пробуем получить результаты
+        try:
+            result, frame_time = self.results_queue.get_nowait()
+            return self._apply_processing_result(frame, result)
+        except:
+            return frame, 0, 0
+
+    def _apply_processing_result(self, frame, result):
+        """Применяет результаты обработки к кадру"""
+        processed_frame = frame.copy()
+
+        for face_data in result['faces']:
+            x, y, w, h = face_data['coords']
+            embedding = face_data['embedding']
+
+            visitor_id = self.save_visitor(embedding)
+            best_match_id, similarity = self.find_best_match(embedding)
+            is_new = similarity <= self.similarity_threshold
+
+            color = (0, 0, 255) if is_new else (0, 255, 0)
+            status = "NEW" if is_new else "KNOWN"
+
+            # Легкая отрисовка
+            cv2.rectangle(processed_frame, (x, y), (x + w, y + h), color, 2)
+            cv2.putText(processed_frame, f'{status}:{visitor_id}', (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+        return processed_frame, result['detected_count'], result['processed_count']
+
     def start_analysis(self, rtsp_url):
-        """Запуск анализа с RTPS камеры Trassir"""
-        logger.info(f"Подключение к камере Trassir: {rtsp_url}")
+        """Запуск оптимизированного анализа"""
+        logger.info("Запуск оптимизированной версии...")
 
         cap = self.setup_rtsp_camera(rtsp_url)
-
         if not cap.isOpened():
-            logger.error(f"Не удалось подключиться к камере: {rtsp_url}")
+            logger.error("Не удалось подключиться к камере")
             return
 
-        logger.info(f"🚀 Анализ Trassir запущен. RTSP: {rtsp_url}")
-        logger.info(f"Всего посетителей в базе: {len(self.known_visitors_cache)}")
+        # Запускаем фоновую обработку
+        self.start_processing_thread()
+
+        logger.info("🚀 Оптимизированный анализ запущен")
 
         try:
             while True:
                 ret, frame = cap.read()
                 if not ret:
-                    logger.warning("Потеряно соединение с камерой, переподключение...")
-                    cap.release()
-                    time.sleep(5)
-                    cap = self.setup_rtsp_camera(rtsp_url)
-                    if not cap.isOpened():
-                        logger.error("Не удалось переподключиться к камере")
-                        break
+                    logger.warning("Потеряно соединение...")
+                    time.sleep(2)
                     continue
 
-                processed_frame, detected, processed, quality = self.process_frame(frame)
+                # Обработка кадра (только отрисовка)
+                processed_frame, detected, processed = self.process_frame_realtime(frame)
 
-                # Расширенная статистика
+                # Легкая статистика
                 stats_text = [
-                    f"TRASSIR CAMERA - 2K",
+                    f"TRASSIR OPTIMIZED",
                     f"Detected: {detected}",
                     f"Processed: {processed}",
-                    f"Total in DB: {len(self.known_visitors_cache)}",
-                    f"Quality: {quality:.2f}",
-                    f"Threshold: {self.similarity_threshold}",
-                    f"Frame: {self.frame_count}",
+                    f"Total: {len(self.known_visitors_cache)}",
+                    f"FPS: {self._calculate_fps()}",
+                    f"Queue: {self.frame_queue.qsize()}",
                     f"Press 'q' to quit"
                 ]
 
-                # Фон для текста
-                overlay = processed_frame.copy()
-                cv2.rectangle(overlay, (0, 0), (400, 200), (0, 0, 0), -1)
-                cv2.addWeighted(overlay, 0.6, processed_frame, 0.4, 0, processed_frame)
-
+                # Простая отрисовка статистики
                 for i, text in enumerate(stats_text):
-                    cv2.putText(processed_frame, text, (10, 25 + i * 25),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    cv2.putText(processed_frame, text, (10, 30 + i * 25),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-                cv2.imshow('Trassir Visitor Analytics - 2K QUALITY', processed_frame)
+                cv2.imshow('Trassir - OPTIMIZED (Smooth Preview)', processed_frame)
 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
-                    logger.info("Остановка по запросу пользователя")
                     break
 
         except KeyboardInterrupt:
-            logger.info("Остановка по Ctrl+C")
-        except Exception as e:
-            logger.error(f"Ошибка во время анализа: {e}")
+            logger.info("Остановка...")
         finally:
+            self.stop_processing = True
             cap.release()
             cv2.destroyAllWindows()
             self.conn.close()
-            logger.info(f"✅ Анализ Trassir завершен. Обработано кадров: {self.frame_count}")
+            logger.info("Анализ завершен")
+
+    def _calculate_fps(self):
+        """Простой расчет FPS"""
+        self.frame_count += 1
+        if self.frame_count % 30 == 0:
+            current_time = time.time()
+            self.last_fps_time = getattr(self, 'last_fps_time', current_time)
+            self.last_fps_count = getattr(self, 'last_fps_count', 0)
+
+            fps = 30 / (current_time - self.last_fps_time)
+            self.last_fps_time = current_time
+            return f"{fps:.1f}"
+        return "calc..."
 
     def cleanup_database(self):
-        """Очистка базы данных для тестирования"""
+        """Очистка базы данных"""
         cursor = self.conn.cursor()
         cursor.execute("DELETE FROM visitors")
-        cursor.execute("DELETE FROM camera_stats")
         self.conn.commit()
         self.known_visitors_cache.clear()
-        logger.info("🗑️ База данных Trassir очищена")
+        logger.info("База данных очищена")
 
 
 def main():
-    """Основная функция для Trassir камеры"""
-
-    # RTSP URL вашей камеры Trassir
+    """Основная функция"""
     RTSP_URL = "rtsp://admin:admin@10.0.0.242:554/live/main"
 
-    # Создаем счетчик оптимизированный для Trassir
-    counter = TrassirVisitorCounter(
-        processing_interval=0.3,  # Частая обработка для плавности
-        similarity_threshold=0.65  # Высокий порог для качественной камеры
+    # Оптимизированные настройки
+    counter = OptimizedTrassirCounter(
+        processing_interval=1.0,  # Увеличили интервал обработки
+        similarity_threshold=0.65
     )
 
     # Раскомментируйте для очистки базы:
@@ -428,9 +390,7 @@ def main():
     try:
         counter.start_analysis(RTSP_URL)
     except Exception as e:
-        logger.error(f"Критическая ошибка: {e}")
-    finally:
-        logger.info("Работа с камерой Trassir завершена")
+        logger.error(f"Ошибка: {e}")
 
 
 if __name__ == "__main__":
