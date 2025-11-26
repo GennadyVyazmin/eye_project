@@ -1,4 +1,4 @@
-# video_analytics_trassir_simple_fixed.py
+# video_analytics_trassir_enhanced.py
 import cv2
 import numpy as np
 import sqlite3
@@ -13,21 +13,33 @@ import os
 import shutil
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('face_detection.log'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
 
-class SimpleTrassirCounter:
+class EnhancedTrassirCounter:
     def __init__(self, processing_interval=1.0, similarity_threshold=0.55, tracking_threshold=0.45):
         """
-        Упрощенная и надежная версия
+        Улучшенная версия с MediaPipe и фильтрацией ложных срабатываний
         """
-        self.conn = sqlite3.connect('visitors_trassir_simple.db', check_same_thread=False)
+        self.conn = sqlite3.connect('visitors_trassir_enhanced.db', check_same_thread=False)
         self._init_database()
 
         self.processing_interval = processing_interval
         self.similarity_threshold = similarity_threshold
         self.tracking_threshold = tracking_threshold
+
+        # Параметры фильтрации
+        self.min_face_size = 80
+        self.max_face_size = 300
+        self.min_confidence = 0.7
 
         # Цвета для индикации статусов
         self.COLORS = {
@@ -35,11 +47,12 @@ class SimpleTrassirCounter:
             'tracking': (255, 255, 0),  # Желтый - создан трек
             'known': (0, 255, 255),  # Голубой - известный пользователь
             'new': (0, 0, 255),  # Красный - новый пользователь в БД
-            'analyzing': (255, 165, 0)  # Оранжевый - анализ в процессе
+            'analyzing': (255, 165, 0),  # Оранжевый - анализ в процессе
+            'filtered': (128, 128, 128)  # Серый - отфильтровано
         }
 
         # Папки для хранения фото
-        self.photos_dir = "visitor_photos_simple"
+        self.photos_dir = "visitor_photos_enhanced"
         self.current_session_dir = "current_session"
         self._create_directories()
 
@@ -63,7 +76,8 @@ class SimpleTrassirCounter:
             'total_detections': 0,
             'new_visitors': 0,
             'known_visitors': 0,
-            'frames_processed': 0
+            'frames_processed': 0,
+            'filtered_detections': 0
         }
         self.last_log_time = time.time()
 
@@ -71,15 +85,8 @@ class SimpleTrassirCounter:
         self.frame_queue = Queue(maxsize=1)
         self.results_queue = Queue()
 
-        # Детектор лиц - пробуем разные каскады
-        self.face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-        )
-
-        # Альтернативный детектор
-        self.alt_face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml'
-        )
+        # Инициализация детекторов
+        self.setup_face_detection_models()
 
         # Предзагрузка известных посетителей
         self._load_known_visitors()
@@ -93,7 +100,32 @@ class SimpleTrassirCounter:
         self.fps_frame_count = 0
         self.current_fps = 0
 
-        logger.info("🎯 Упрощенная система инициализирована")
+        logger.info("🎯 Улучшенная система инициализирована с MediaPipe")
+
+    def setup_face_detection_models(self):
+        """Инициализация моделей детекции лиц"""
+        try:
+            # Инициализация MediaPipe
+            import mediapipe as mp
+            self.mp_face_detection = mp.solutions.face_detection
+            self.mp_drawing = mp.solutions.drawing_utils
+            self.face_detection = self.mp_face_detection.FaceDetection(
+                model_selection=0,  # 0 для ближних, 1 для дальних лиц
+                min_detection_confidence=0.5
+            )
+            self.use_mediapipe = True
+            logger.info("✅ MediaPipe инициализирован для детекции лиц")
+        except ImportError as e:
+            self.use_mediapipe = False
+            logger.warning(f"❌ MediaPipe не доступен: {e}. Используем OpenCV")
+
+        # Резервные каскады OpenCV
+        self.face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        )
+        self.alt_face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml'
+        )
 
     def _create_directories(self):
         """Создание папок для хранения фото"""
@@ -135,44 +167,150 @@ class SimpleTrassirCounter:
 
         logger.info(f"📊 Загружено посетителей: {len(self.known_visitors_cache)}")
 
-    def detect_faces_robust(self, frame):
-        """Надежная детекция лиц с разными каскадами"""
+    def detect_faces_mediapipe(self, frame):
+        """Детекция лиц с использованием MediaPipe"""
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.face_detection.process(rgb_frame)
+
+        faces = []
+        if results.detections:
+            for detection in results.detections:
+                bbox = detection.location_data.relative_bounding_box
+                h, w = frame.shape[:2]
+
+                x = int(bbox.xmin * w)
+                y = int(bbox.ymin * h)
+                width = int(bbox.width * w)
+                height = int(bbox.height * h)
+
+                # Увеличиваем bounding box немного для лучшего захвата
+                x = max(0, x - 15)
+                y = max(0, y - 15)
+                width = min(w - x, width + 30)
+                height = min(h - y, height + 30)
+
+                confidence = detection.score[0]
+
+                # Фильтрация по уверенности и размеру
+                if (confidence >= self.min_confidence and
+                        width >= self.min_face_size and height >= self.min_face_size and
+                        width <= self.max_face_size and height <= self.max_face_size):
+
+                    # Дополнительная проверка на валидность
+                    if self.is_valid_face_region(frame, x, y, width, height):
+                        faces.append((x, y, width, height))
+                        logger.debug(f"✅ MediaPipe обнаружено лицо с уверенностью {confidence:.3f}")
+
+        return faces
+
+    def detect_faces_opencv(self, frame):
+        """Резервная детекция лиц с OpenCV"""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Пробуем основной каскад
+        # Основной каскад с улучшенными параметрами
         faces1 = self.face_cascade.detectMultiScale(
             gray,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(50, 50),
-            maxSize=(400, 400),
+            scaleFactor=1.2,
+            minNeighbors=7,
+            minSize=(self.min_face_size, self.min_face_size),
+            maxSize=(self.max_face_size, self.max_face_size),
             flags=cv2.CASCADE_SCALE_IMAGE
         )
 
-        # Пробуем альтернативный каскад
-        faces2 = self.alt_face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=4,
-            minSize=(40, 40),
-            maxSize=(400, 400),
-            flags=cv2.CASCADE_SCALE_IMAGE
-        )
+        # Фильтрация ложных срабатываний
+        valid_faces = []
+        for (x, y, w, h) in faces1:
+            # Проверка соотношения сторон
+            aspect_ratio = w / h
+            if 0.7 < aspect_ratio < 1.8:
+                # Проверка текстуры и характеристик
+                roi = gray[y:y + h, x:x + w]
+                if self.is_likely_face(roi) and self.is_valid_face_region(frame, x, y, w, h):
+                    valid_faces.append((x, y, w, h))
 
-        # Объединяем результаты
-        all_faces = []
-        face_set = set()
+        return valid_faces
 
-        for faces in [faces1, faces2]:
-            for (x, y, w, h) in faces:
-                # Проверяем на дубликаты
-                face_key = (x // 10, y // 10, w // 10, h // 10)  # Грубая группировка
-                if face_key not in face_set:
-                    face_set.add(face_key)
-                    all_faces.append((x, y, w, h))
+    def is_valid_face_region(self, frame, x, y, w, h):
+        """Проверка валидности региона лица"""
+        h_total, w_total = frame.shape[:2]
 
-        logger.info(f"🔍 Детекция: основной {len(faces1)}, альтернативный {len(faces2)}, итого {len(all_faces)}")
-        return all_faces
+        # Проверка выхода за границы
+        if x < 0 or y < 0 or x + w > w_total or y + h > h_total:
+            return False
+
+        # Проверка размера (относительно размера кадра)
+        if w < w_total * 0.05 or h < h_total * 0.05:  # Слишком маленький
+            return False
+        if w > w_total * 0.4 or h > h_total * 0.4:  # Слишком большой
+            return False
+
+        return True
+
+    def is_likely_face(self, face_roi):
+        """Проверка, что регион вероятнее всего является лицом"""
+        if face_roi.size == 0:
+            return False
+
+        # Проверка вариации интенсивности (лица обычно имеют высокий контраст)
+        std_dev = np.std(face_roi)
+        if std_dev < 20:  # Слишком однородная текстура - вероятно не лицо
+            return False
+
+        # Проверка гистограммы
+        hist = cv2.calcHist([face_roi], [0], None, [8], [0, 256])
+        hist = hist.flatten()
+        if hist.sum() > 0:
+            hist = hist / hist.sum()
+
+        # Поиск пиков в гистограмме
+        peak_count = 0
+        for i in range(1, len(hist) - 1):
+            if hist[i] > hist[i - 1] and hist[i] > hist[i + 1] and hist[i] > 0.1:
+                peak_count += 1
+
+        return peak_count >= 1
+
+    def validate_human_features(self, face_image):
+        """Проверка что обнаруженный объект имеет характеристики человека"""
+        if face_image.size == 0:
+            return False
+
+        h, w = face_image.shape[:2]
+
+        # Проверка размера
+        if w < 50 or h < 50 or w > 400 or h > 400:
+            return False
+
+        try:
+            # Проверка цветового распределения (кожа человека)
+            hsv = cv2.cvtColor(face_image, cv2.COLOR_BGR2HSV)
+
+            # Маска для цветов кожи
+            skin_lower = np.array([0, 20, 70], dtype=np.uint8)
+            skin_upper = np.array([20, 255, 255], dtype=np.uint8)
+            skin_mask = cv2.inRange(hsv, skin_lower, skin_upper)
+
+            # Процент пикселей кожи
+            skin_ratio = np.sum(skin_mask > 0) / (w * h)
+
+            # Для лиц обычно 15-50% пикселей соответствуют цвету кожи
+            return 0.1 < skin_ratio < 0.7
+        except:
+            return True  # Если не удалось проверить, даем шанс
+
+    def detect_faces_enhanced(self, frame):
+        """Улучшенная детекция лиц с приоритетом MediaPipe"""
+        if self.use_mediapipe:
+            faces = self.detect_faces_mediapipe(frame)
+            if faces:
+                logger.info(f"🔍 MediaPipe: {len(faces)} лиц")
+                return faces
+
+        # Резервный вариант с OpenCV
+        faces = self.detect_faces_opencv(frame)
+        logger.info(f"🔍 OpenCV: {len(faces)} лиц")
+
+        return faces
 
     def get_fast_embedding(self, face_image):
         """Быстрое получение эмбеддинга"""
@@ -459,7 +597,8 @@ class SimpleTrassirCounter:
             'tracking': 'TRACKING',
             'analyzing': 'ANALYZING',
             'known': 'KNOWN',
-            'new': 'NEW USER'
+            'new': 'NEW USER',
+            'filtered': 'FILTERED'
         }
         return status_texts.get(status, 'UNKNOWN')
 
@@ -538,7 +677,8 @@ class SimpleTrassirCounter:
                         f"Активных треков: {len(self.face_tracks)}, "
                         f"В галерее: {len(self.current_visitors_gallery)}, "
                         f"Новых за сессию: {self.recognition_stats['new_visitors']}, "
-                        f"Известных: {self.recognition_stats['known_visitors']}")
+                        f"Известных: {self.recognition_stats['known_visitors']}, "
+                        f"Отфильтровано: {self.recognition_stats['filtered_detections']}")
             self.last_log_time = current_time
 
     def start_processing_thread(self):
@@ -564,45 +704,60 @@ class SimpleTrassirCounter:
                 continue
 
     def _process_frame_heavy(self, frame):
-        """Тяжелые операции обработки"""
+        """Тяжелые операции обработки с улучшенной фильтрацией"""
         try:
-            # Детекция лиц
-            faces = self.detect_faces_robust(frame)
+            # Детекция лиц с улучшенной фильтрацией
+            faces = self.detect_faces_enhanced(frame)
 
             processed_faces = []
+            filtered_count = 0
+
             if len(faces) > 0:
                 self.recognition_stats['total_detections'] += len(faces)
-                logger.info(f"👥 ОБНАРУЖЕНО ЛИЦ: {len(faces)}")
+                logger.info(f"👥 ОБНАРУЖЕНО ОБЪЕКТОВ: {len(faces)}")
 
                 for (x, y, w, h) in faces:
-                    if 50 <= w <= 400 and 50 <= h <= 400:
-                        face_img = frame[y:y + h, x:x + w]
+                    # Расширенная проверка валидности
+                    if not self.is_valid_face_region(frame, x, y, w, h):
+                        filtered_count += 1
+                        continue
 
-                        embedding = self.get_fast_embedding(face_img)
-                        if embedding is not None:
-                            visitor_id, similarity = self.find_best_match(embedding)
+                    face_img = frame[y:y + h, x:x + w]
 
-                            processed_faces.append({
-                                'coords': (x, y, w, h),
-                                'embedding': embedding,
-                                'similarity': similarity,
-                                'visitor_id': visitor_id,
-                                'status': 'detected',
-                                'face_image': face_img
-                            })
-                        else:
-                            logger.warning("❌ Не удалось получить эмбеддинг для лица")
+                    # Проверка характеристик человека
+                    if not self.validate_human_features(face_img):
+                        filtered_count += 1
+                        logger.debug("❌ Отфильтрован не-человеческий объект")
+                        continue
+
+                    embedding = self.get_fast_embedding(face_img)
+                    if embedding is not None:
+                        visitor_id, similarity = self.find_best_match(embedding)
+
+                        processed_faces.append({
+                            'coords': (x, y, w, h),
+                            'embedding': embedding,
+                            'similarity': similarity,
+                            'visitor_id': visitor_id,
+                            'status': 'detected',
+                            'face_image': face_img
+                        })
+                    else:
+                        logger.warning("❌ Не удалось получить эмбеддинг для лица")
+
+            self.recognition_stats['filtered_detections'] += filtered_count
 
             return {
                 'faces': processed_faces,
                 'processed_count': len(processed_faces),
                 'detected_count': len(faces),
+                'filtered_count': filtered_count,
                 'timestamp': time.time()
             }
 
         except Exception as e:
             logger.error(f"❌ Ошибка в фоновой обработке: {e}")
-            return {'faces': [], 'processed_count': 0, 'detected_count': 0}
+            return {'faces': [], 'processed_count': 0, 'detected_count': 0, 'filtered_count': 0}
 
     def setup_rtsp_camera(self, rtsp_url):
         """Настройка RTSP"""
@@ -645,7 +800,7 @@ class SimpleTrassirCounter:
                 result, frame_time = self.results_queue.get_nowait()
                 return self._apply_processing_result(frame, result, current_time)
             except:
-                return frame, 0, 0
+                return frame, 0, 0, 0
 
         # Отправляем в фоновую обработку
         if self.frame_queue.empty():
@@ -658,7 +813,7 @@ class SimpleTrassirCounter:
             result, frame_time = self.results_queue.get_nowait()
             return self._apply_processing_result(frame, result, current_time)
         except:
-            return frame, 0, 0
+            return frame, 0, 0, 0
 
     def _apply_processing_result(self, frame, result, current_time):
         """Применяет результаты обработки"""
@@ -692,11 +847,11 @@ class SimpleTrassirCounter:
 
         self.log_recognition_stats()
 
-        return processed_frame, result['detected_count'], processed_count
+        return processed_frame, result['detected_count'], processed_count, result['filtered_count']
 
     def start_analysis(self, rtsp_url):
         """Запуск анализа"""
-        logger.info("🚀 Запуск упрощенной версии...")
+        logger.info("🚀 Запуск улучшенной версии с MediaPipe...")
 
         cap = self.setup_rtsp_camera(rtsp_url)
         if not cap.isOpened():
@@ -705,7 +860,7 @@ class SimpleTrassirCounter:
         self.start_processing_thread()
         logger.info("✅ Анализ запущен")
 
-        window_name = 'Trassir Analytics - SIMPLE & RELIABLE'
+        window_name = 'Trassir Analytics - ENHANCED with MediaPipe'
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_name, 1600, 900)
 
@@ -717,15 +872,16 @@ class SimpleTrassirCounter:
                     time.sleep(2)
                     continue
 
-                processed_frame, detected, processed = self.process_frame_realtime(frame)
+                processed_frame, detected, processed, filtered = self.process_frame_realtime(frame)
                 display_frame = self.resize_frame_for_display(processed_frame, target_width=1280)
                 display_with_gallery = self.create_gallery_display(display_frame)
 
                 # Статистика на экране
                 stats_text = [
-                    f"SIMPLE & RELIABLE ANALYTICS",
-                    f"Faces detected: {detected}",
-                    f"Visitors processed: {processed}",
+                    f"ENHANCED ANALYTICS with MediaPipe",
+                    f"Objects detected: {detected}",
+                    f"Faces processed: {processed}",
+                    f"Filtered: {filtered}",
                     f"Active tracks: {len(self.face_tracks)}",
                     f"In gallery: {len(self.current_visitors_gallery)}",
                     f"FPS: {self.current_fps:.1f}",
@@ -733,12 +889,15 @@ class SimpleTrassirCounter:
                 ]
 
                 overlay = display_with_gallery.copy()
-                cv2.rectangle(overlay, (0, 0), (500, 200), (0, 0, 0), -1)
+                cv2.rectangle(overlay, (0, 0), (500, 220), (0, 0, 0), -1)
                 cv2.addWeighted(overlay, 0.7, display_with_gallery, 0.3, 0, display_with_gallery)
 
                 for i, text in enumerate(stats_text):
+                    color = (255, 255, 255)
+                    if "Filtered" in text and filtered > 0:
+                        color = (0, 255, 255)  # Желтый для фильтрованных объектов
                     cv2.putText(display_with_gallery, text, (10, 30 + i * 25),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
                 cv2.imshow(window_name, display_with_gallery)
 
@@ -759,6 +918,7 @@ class SimpleTrassirCounter:
             logger.info(f"   Всего посетителей: {len(self.known_visitors_cache)}")
             logger.info(f"   Новых создано: {self.recognition_stats['new_visitors']}")
             logger.info(f"   Известных обработано: {self.recognition_stats['known_visitors']}")
+            logger.info(f"   Отфильтровано объектов: {self.recognition_stats['filtered_detections']}")
             logger.info("✅ Анализ завершен")
 
 
@@ -766,7 +926,7 @@ def main():
     """Основная функция"""
     RTSP_URL = "rtsp://admin:admin@10.0.0.242:554/live/main"
 
-    counter = SimpleTrassirCounter(
+    counter = EnhancedTrassirCounter(
         processing_interval=1.0,
         similarity_threshold=0.55,
         tracking_threshold=0.45
