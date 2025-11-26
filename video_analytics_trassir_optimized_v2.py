@@ -1,4 +1,4 @@
-# video_analytics_trassir_optimized_v2.py
+# video_analytics_trassir_optimized_v2_with_gui_scale.py
 import cv2
 import numpy as np
 import sqlite3
@@ -16,16 +16,21 @@ logger = logging.getLogger(__name__)
 
 
 class OptimizedTrassirCounter:
-    def __init__(self, processing_interval=1.5, similarity_threshold=0.55, tracking_threshold=0.45):
+    def __init__(self, processing_interval=1.5, similarity_threshold=0.55, tracking_threshold=0.45,
+                 gui_scale=0.7, gui_max_width=1200):
         """
-        Версия с улучшенным трекингом и стабильностью распознавания
+        Версия с настройкой размера GUI окна
         """
         self.conn = sqlite3.connect('visitors_trassir_opt_v2.db', check_same_thread=False)
         self._init_database()
 
         self.processing_interval = processing_interval
-        self.similarity_threshold = similarity_threshold  # Основной порог
-        self.tracking_threshold = tracking_threshold  # Порог для трекинга
+        self.similarity_threshold = similarity_threshold
+        self.tracking_threshold = tracking_threshold
+
+        # Настройки GUI
+        self.gui_scale = gui_scale  # Масштаб окна (0.5 = 50%, 1.0 = 100%)
+        self.gui_max_width = gui_max_width  # Максимальная ширина окна
 
         # Трекинг состояния
         self.last_processing_time = 0
@@ -33,16 +38,21 @@ class OptimizedTrassirCounter:
         self.frame_count = 0
 
         # Система трекинга лиц между кадрами
-        self.face_tracks = {}  # {track_id: {'embedding': ..., 'last_seen': ..., 'visitor_id': ...}}
+        self.face_tracks = {}
         self.next_track_id = 1
-        self.track_max_age = 3.0  # секунды жизни трека без обновления
+        self.track_max_age = 3.0
 
-        # Временный кэш для стабилизации распознавания
-        self.temp_face_cache = defaultdict(lambda: deque(maxlen=10))  # {visitor_id: [embeddings]}
-        self.min_confirmations = 3  # минимальное подтверждение для нового пользователя
+        # Статистика для логирования
+        self.recognition_stats = {
+            'total_detections': 0,
+            'new_visitors': 0,
+            'known_visitors': 0,
+            'duplicates_prevented': 0
+        }
+        self.last_log_time = time.time()
 
         # Очередь для асинхронной обработки
-        self.frame_queue = Queue(maxsize=1)  # Только 1 кадр в очереди для свежести
+        self.frame_queue = Queue(maxsize=1)
         self.results_queue = Queue()
 
         # Загрузка детектора лиц
@@ -62,7 +72,7 @@ class OptimizedTrassirCounter:
         self.fps_frame_count = 0
         self.current_fps = 0
 
-        logger.info(f"Улучшенная инициализация с трекингом. Пороги: {similarity_threshold}/{tracking_threshold}")
+        logger.info(f"Улучшенная инициализация. GUI масштаб: {gui_scale}, Макс.ширина: {gui_max_width}")
 
     def _init_database(self):
         """Инициализация базы данных"""
@@ -95,7 +105,39 @@ class OptimizedTrassirCounter:
                 except Exception as e:
                     logger.warning(f"Ошибка загрузки посетителя {visitor_id}: {e}")
 
-        logger.info(f"Загружено посетителей: {len(self.known_visitors_cache)}")
+        logger.info(f"📊 Загружено посетителей из базы: {len(self.known_visitors_cache)}")
+
+    def resize_frame_for_display(self, frame):
+        """Изменение размера кадра для отображения в GUI"""
+        if self.gui_scale == 1.0 and frame.shape[1] <= self.gui_max_width:
+            return frame
+
+        height, width = frame.shape[:2]
+
+        # Вычисляем новые размеры
+        new_width = int(width * self.gui_scale)
+        new_height = int(height * self.gui_scale)
+
+        # Ограничиваем максимальной шириной
+        if new_width > self.gui_max_width:
+            scale = self.gui_max_width / new_width
+            new_width = self.gui_max_width
+            new_height = int(new_height * scale)
+
+        # Ресайз с интерполяцией для качества
+        resized_frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
+
+        return resized_frame
+
+    def log_recognition_stats(self):
+        """Логирование статистики распознавания"""
+        current_time = time.time()
+        if current_time - self.last_log_time >= 5.0:
+            logger.info(f"📈 СТАТИСТИКА: Всего в базе: {len(self.known_visitors_cache)}, "
+                        f"Активных треков: {len(self.face_tracks)}, "
+                        f"Новых за сессию: {self.recognition_stats['new_visitors']}, "
+                        f"Известных: {self.recognition_stats['known_visitors']}")
+            self.last_log_time = current_time
 
     def start_processing_thread(self):
         """Запуск фонового потока обработки"""
@@ -137,7 +179,7 @@ class OptimizedTrassirCounter:
             faces = self.face_cascade.detectMultiScale(
                 gray,
                 scaleFactor=1.1,
-                minNeighbors=6,  # Увеличили для уменьшения ложных срабатываний
+                minNeighbors=6,
                 minSize=(60, 60),
                 maxSize=(300, 300),
                 flags=cv2.CASCADE_SCALE_IMAGE
@@ -145,6 +187,8 @@ class OptimizedTrassirCounter:
 
             processed_faces = []
             if len(faces) > 0:
+                logger.info(f"👥 Обнаружено лиц в кадре: {len(faces)}")
+
                 for (x, y, w, h) in faces:
                     # Масштабируем координаты обратно
                     scale_x = width / frame_small.shape[1]
@@ -160,7 +204,6 @@ class OptimizedTrassirCounter:
 
                         embedding = self.get_fast_embedding(face_img)
                         if embedding is not None:
-                            # Находим лучший match среди известных
                             visitor_id, similarity = self.find_best_match(embedding)
 
                             processed_faces.append({
@@ -185,10 +228,7 @@ class OptimizedTrassirCounter:
     def get_fast_embedding(self, face_image):
         """Быстрое получение эмбеддинга с улучшенной стабильностью"""
         try:
-            # Стандартный размер для стабильности
-            face_resized = cv2.resize(face_image, (112, 112))  # Стандарт для FaceNet
-
-            # Базовая предобработка
+            face_resized = cv2.resize(face_image, (112, 112))
             face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
 
             # Нормализация яркости
@@ -204,7 +244,7 @@ class OptimizedTrassirCounter:
                 model_name='Facenet',
                 enforce_detection=False,
                 detector_backend='skip',
-                align=True  # Включаем выравнивание для стабильности
+                align=True
             )
 
             embedding = np.array(result[0]['embedding'], dtype=np.float32)
@@ -248,14 +288,12 @@ class OptimizedTrassirCounter:
         best_match_id = None
         best_similarity = 0.0
 
-        # Сначала проверяем известных посетителей
         for visitor_id, known_embedding in self.known_visitors_cache.items():
             similarity = self.calculate_similarity(embedding, known_embedding)
             if similarity > best_similarity:
                 best_similarity = similarity
                 best_match_id = visitor_id
 
-        # Если нашли хорошее соответствие, возвращаем
         if best_similarity > self.tracking_threshold:
             return best_match_id, best_similarity
 
@@ -269,12 +307,10 @@ class OptimizedTrassirCounter:
             embedding = face_data['embedding']
             coords = face_data['coords']
 
-            # Ищем ближайший существующий трек
             best_track_id = None
             best_similarity = 0.0
 
             for track_id, track_data in list(self.face_tracks.items()):
-                # Проверяем возраст трека
                 if timestamp - track_data['last_seen'] > self.track_max_age:
                     del self.face_tracks[track_id]
                     continue
@@ -285,7 +321,6 @@ class OptimizedTrassirCounter:
                     best_track_id = track_id
 
             if best_track_id is not None:
-                # Обновляем существующий трек
                 self.face_tracks[best_track_id].update({
                     'embedding': embedding,
                     'last_seen': timestamp,
@@ -293,8 +328,8 @@ class OptimizedTrassirCounter:
                 })
                 face_data['track_id'] = best_track_id
                 face_data['visitor_id'] = self.face_tracks[best_track_id].get('visitor_id')
+                logger.debug(f"🔄 Обновлен трек {best_track_id}, схожесть: {best_similarity:.3f}")
             else:
-                # Создаем новый трек
                 track_id = self.next_track_id
                 self.next_track_id += 1
                 self.face_tracks[track_id] = {
@@ -305,6 +340,7 @@ class OptimizedTrassirCounter:
                     'created_at': timestamp
                 }
                 face_data['track_id'] = track_id
+                logger.info(f"🎯 Создан новый трек {track_id}")
 
             updated_faces.append(face_data)
 
@@ -319,31 +355,35 @@ class OptimizedTrassirCounter:
         embedding = face_data['embedding']
         timestamp = time.time()
 
-        # Если уже есть visitor_id, обновляем его
         if track_data['visitor_id']:
             visitor_id = track_data['visitor_id']
-            # Обновляем эмбеддинг в кэше (усредняем для стабильности)
             if visitor_id in self.known_visitors_cache:
                 old_embedding = self.known_visitors_cache[visitor_id]
-                # Простое усреднение для стабильности
                 new_embedding = 0.7 * old_embedding + 0.3 * embedding
                 self.known_visitors_cache[visitor_id] = new_embedding / np.linalg.norm(new_embedding)
+
+            self.recognition_stats['known_visitors'] += 1
+            logger.debug(f"♻️  Подтвержден известный посетитель {visitor_id}")
             return visitor_id
 
-        # Ищем лучшего кандидата среди известных
         visitor_id, similarity = self.find_best_match(embedding)
 
         if similarity > self.similarity_threshold:
-            # Подтверждаем существующего посетителя
             track_data['visitor_id'] = visitor_id
             track_data['confirmed_at'] = timestamp
+            self.recognition_stats['known_visitors'] += 1
+            logger.info(f"👤 ОПОЗНАН известный посетитель {visitor_id}, схожесть: {similarity:.3f}")
             return visitor_id
         else:
-            # Ждем несколько подтверждений для нового посетителя
             track_duration = timestamp - track_data['created_at']
-            if track_duration > 2.0:  # Минимум 2 секунды трекинга
-                # Создаем нового посетителя
-                return self._create_new_visitor(embedding, track_id)
+            if track_duration > 2.0:
+                new_visitor_id = self._create_new_visitor(embedding, track_id)
+                if new_visitor_id:
+                    self.recognition_stats['new_visitors'] += 1
+                    logger.info(f"🆕 СОЗДАН новый посетитель {new_visitor_id}, схожесть с известными: {similarity:.3f}")
+                return new_visitor_id
+            else:
+                logger.debug(f"⏳ Трек {track_id} ожидает подтверждения ({track_duration:.1f}s)")
 
         return None
 
@@ -362,11 +402,9 @@ class OptimizedTrassirCounter:
         self.known_visitors_cache[visitor_id] = embedding
         self.conn.commit()
 
-        # Обновляем трек
         if track_id in self.face_tracks:
             self.face_tracks[track_id]['visitor_id'] = visitor_id
 
-        logger.info(f"🆕 ПОДТВЕРЖДЕН новый посетитель {visitor_id}")
         return visitor_id
 
     def save_visitor_visit(self, visitor_id, embedding):
@@ -382,10 +420,11 @@ class OptimizedTrassirCounter:
             (now, now, visitor_id)
         )
         self.conn.commit()
+        logger.debug(f"📝 Обновлен визит посетителя {visitor_id}")
 
     def setup_rtsp_camera(self, rtsp_url):
         """Настройка RTSP"""
-        logger.info(f"Подключение к камере: {rtsp_url}")
+        logger.info(f"📡 Подключение к камере: {rtsp_url}")
         cap = cv2.VideoCapture(rtsp_url)
 
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -398,9 +437,11 @@ class OptimizedTrassirCounter:
         if cap.isOpened():
             ret, test_frame = cap.read()
             if ret:
-                logger.info(f"Камера подключена. Разрешение: {test_frame.shape[1]}x{test_frame.shape[0]}")
+                original_size = f"{test_frame.shape[1]}x{test_frame.shape[0]}"
+                display_size = f"{int(test_frame.shape[1] * self.gui_scale)}x{int(test_frame.shape[0] * self.gui_scale)}"
+                logger.info(f"✅ Камера подключена. Оригинал: {original_size}, GUI: {display_size}")
         else:
-            logger.error("Не удалось подключиться к камере")
+            logger.error("❌ Не удалось подключиться к камере")
 
         return cap
 
@@ -408,14 +449,12 @@ class OptimizedTrassirCounter:
         """Обработка кадра с улучшенным трекингом"""
         current_time = time.time()
 
-        # Обновляем FPS
         self.fps_frame_count += 1
         if current_time - self.fps_start_time >= 1.0:
             self.current_fps = self.fps_frame_count / (current_time - self.fps_start_time)
             self.fps_frame_count = 0
             self.fps_start_time = current_time
 
-        # Обрабатываем с интервалом
         if current_time - self.last_processing_time < self.processing_interval:
             try:
                 result, frame_time = self.results_queue.get_nowait()
@@ -423,13 +462,11 @@ class OptimizedTrassirCounter:
             except:
                 return frame, 0, 0
 
-        # Отправляем в фоновую обработку
         if self.frame_queue.empty():
             self.frame_queue.put((frame.copy(), current_time))
 
         self.last_processing_time = current_time
 
-        # Пробуем получить результаты
         try:
             result, frame_time = self.results_queue.get_nowait()
             return self._apply_processing_result(frame, result, current_time)
@@ -441,7 +478,6 @@ class OptimizedTrassirCounter:
         processed_frame = frame.copy()
         processed_count = 0
 
-        # Обновляем трекинг
         tracked_faces = self.update_face_tracking(result['faces'], current_time)
 
         for face_data in tracked_faces:
@@ -451,12 +487,10 @@ class OptimizedTrassirCounter:
                 self.save_visitor_visit(visitor_id, face_data['embedding'])
                 x, y, w, h = face_data['coords']
 
-                # Определяем статус
                 is_new = face_data['similarity'] <= self.similarity_threshold
                 color = (0, 0, 255) if is_new else (0, 255, 0)
                 status = "NEW" if is_new else "KNOWN"
 
-                # Отрисовка
                 cv2.rectangle(processed_frame, (x, y), (x + w, y + h), color, 2)
                 cv2.putText(processed_frame, f'{status}:{visitor_id}', (x, y - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
@@ -465,11 +499,13 @@ class OptimizedTrassirCounter:
 
                 processed_count += 1
 
+        self.log_recognition_stats()
+
         return processed_frame, result['detected_count'], processed_count
 
     def start_analysis(self, rtsp_url):
-        """Запуск анализа с улучшенным трекингом"""
-        logger.info("Запуск улучшенной версии с трекингом...")
+        """Запуск анализа с настраиваемым GUI"""
+        logger.info("🚀 Запуск версии с настраиваемым размером GUI...")
 
         cap = self.setup_rtsp_camera(rtsp_url)
         if not cap.isOpened():
@@ -477,40 +513,51 @@ class OptimizedTrassirCounter:
 
         self.start_processing_thread()
 
-        logger.info("🚀 Улучшенный анализ с трекингом запущен")
+        logger.info("✅ Анализ запущен")
+
+        # Создаем окно с возможностью изменения размера
+        window_name = f'Trassir Analytics - Scale: {self.gui_scale}'
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
         try:
             while True:
                 ret, frame = cap.read()
                 if not ret:
-                    logger.warning("Потеряно соединение...")
+                    logger.warning("📡 Потеряно соединение с камерой...")
                     time.sleep(2)
                     continue
 
                 processed_frame, detected, processed = self.process_frame_realtime(frame)
 
-                # Статистика
+                # Изменяем размер для отображения
+                display_frame = self.resize_frame_for_display(processed_frame)
+
+                # Статистика на экране (масштабируем текст)
+                scale_factor = display_frame.shape[1] / processed_frame.shape[1]
+                font_scale = 0.5 * scale_factor
+                thickness = max(1, int(1 * scale_factor))
+
                 stats_text = [
-                    f"TRASSIR WITH TRACKING",
+                    f"TRASSIR - GUI Scale: {self.gui_scale}",
                     f"Detected: {detected}",
                     f"Processed: {processed}",
-                    f"Total: {len(self.known_visitors_cache)}",
-                    f"Tracks: {len(self.face_tracks)}",
+                    f"Total in DB: {len(self.known_visitors_cache)}",
+                    f"Active Tracks: {len(self.face_tracks)}",
                     f"FPS: {self.current_fps:.1f}",
                     f"Press 'q' to quit"
                 ]
 
                 for i, text in enumerate(stats_text):
-                    cv2.putText(processed_frame, text, (10, 30 + i * 25),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(display_frame, text, (10, int(30 + i * 25 * scale_factor)),
+                                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
 
-                cv2.imshow('Trassir - WITH FACE TRACKING', processed_frame)
+                cv2.imshow(window_name, display_frame)
 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
         except KeyboardInterrupt:
-            logger.info("Остановка...")
+            logger.info("⏹️ Остановка по Ctrl+C...")
         finally:
             self.stop_processing = True
             if self.processing_thread:
@@ -518,7 +565,12 @@ class OptimizedTrassirCounter:
             cap.release()
             cv2.destroyAllWindows()
             self.conn.close()
-            logger.info("Анализ завершен")
+
+            logger.info(f"📊 ФИНАЛЬНАЯ СТАТИСТИКА:")
+            logger.info(f"   Всего уникальных посетителей: {len(self.known_visitors_cache)}")
+            logger.info(f"   Новых создано за сессию: {self.recognition_stats['new_visitors']}")
+            logger.info(f"   Известных обработано: {self.recognition_stats['known_visitors']}")
+            logger.info("✅ Анализ завершен")
 
     def cleanup_database(self):
         """Очистка базы данных"""
@@ -527,18 +579,24 @@ class OptimizedTrassirCounter:
         self.conn.commit()
         self.known_visitors_cache.clear()
         self.face_tracks.clear()
-        logger.info("База данных очищена")
+        logger.info("🗑️ База данных очищена")
 
 
 def main():
-    """Основная функция"""
+    """Основная функция с настройками GUI"""
     RTSP_URL = "rtsp://admin:admin@10.0.0.242:554/live/main"
+
+    # НАСТРОЙКИ ГРАФИЧЕСКОГО ИНТЕРФЕЙСА:
+    GUI_SCALE = 0.6  # 0.6 = 60% от оригинального размера (0.1-1.0)
+    GUI_MAX_WIDTH = 1000  # Максимальная ширина окна в пикселях
 
     # Улучшенные настройки
     counter = OptimizedTrassirCounter(
-        processing_interval=1.5,  # Увеличили интервал
-        similarity_threshold=0.55,  # Более строгий порог
-        tracking_threshold=0.45  # Порог для трекинга
+        processing_interval=1.5,
+        similarity_threshold=0.55,
+        tracking_threshold=0.45,
+        gui_scale=GUI_SCALE,
+        gui_max_width=GUI_MAX_WIDTH
     )
 
     # counter.cleanup_database()
@@ -546,7 +604,7 @@ def main():
     try:
         counter.start_analysis(RTSP_URL)
     except Exception as e:
-        logger.error(f"Ошибка: {e}")
+        logger.error(f"❌ Критическая ошибка: {e}")
 
 
 if __name__ == "__main__":
