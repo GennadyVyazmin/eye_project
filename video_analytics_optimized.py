@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class VisitorCounter:
-    def __init__(self, processing_interval=5.0, similarity_threshold=0.75):
+    def __init__(self, processing_interval=0.3, similarity_threshold=0.12):
         """
         Инициализация счетчика посетителей
         """
@@ -185,8 +185,54 @@ class VisitorCounter:
         self.conn.commit()
         return visitor_id
 
+    def _process_multiple_faces(self, face_data, processed_frame):
+        """Обработка нескольких лиц с проверкой дубликатов в кадре"""
+        processed_count = 0
+        embeddings_cache = {}  # Кэш эмбеддингов для текущего кадра
+
+        # Первый проход: получаем эмбеддинги для всех лиц
+        for i, (x, y, w, h, face_img) in enumerate(face_data):
+            try:
+                embedding = self.get_face_embedding(face_img)
+                if embedding is not None:
+                    embeddings_cache[i] = (x, y, w, h, embedding)
+            except Exception as e:
+                logger.warning(f"Ошибка получения эмбеддинга для лица {i}: {e}")
+
+        # Второй проход: обработка с проверкой дубликатов в кадре
+        processed_embeddings = []
+
+        for i, (x, y, w, h, embedding) in embeddings_cache.items():
+            # Проверка на дубликаты в текущем кадре
+            is_duplicate_in_frame = False
+            for existing_embedding in processed_embeddings:
+                if self.calculate_similarity(embedding, existing_embedding) > 0.8:
+                    is_duplicate_in_frame = True
+                    break
+
+            if not is_duplicate_in_frame:
+                visitor_id = self.save_visitor(embedding)
+                processed_embeddings.append(embedding)
+                processed_count += 1
+
+                # Определяем цвет рамки: красный для новых, зеленый для известных
+                best_match_id, similarity = self.find_best_match(embedding)
+                is_new = similarity <= self.similarity_threshold
+
+                color = (0, 0, 255) if is_new else (0, 255, 0)  # Красный для новых, зеленый для известных
+                status = "NEW" if is_new else "KNOWN"
+
+                # Отрисовка
+                cv2.rectangle(processed_frame, (x, y), (x + w, y + h), color, 2)
+                cv2.putText(processed_frame, f'{status}: {visitor_id}', (x, y - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                cv2.putText(processed_frame, f'Visits: {self.get_visit_count(visitor_id)}',
+                            (x, y + h + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+        return processed_count
+
     def process_frame(self, frame):
-        """Обработка кадра"""
+        """Обработка кадра с улучшенной обработкой нескольких лиц"""
         current_time = time.time()
 
         # Пропускаем кадр если не прошел интервал
@@ -208,36 +254,19 @@ class VisitorCounter:
 
         if detected_count > 0:
             processed_frame = frame.copy()
-            current_embeddings = []
+            face_data = []
 
+            # Собираем данные всех лиц
             for (x, y, w, h) in faces:
                 # Фильтрация по размеру
                 if w < 50 or h < 50 or w > 300 or h > 300:
                     continue
 
                 face_img = frame[y:y + h, x:x + w]
-                embedding = self.get_face_embedding(face_img)
+                face_data.append((x, y, w, h, face_img))
 
-                if embedding is not None:
-                    # Проверка на дубликаты в текущем кадре
-                    is_duplicate = False
-                    for existing_embedding in current_embeddings:
-                        if self.calculate_similarity(embedding, existing_embedding) > 0.8:
-                            is_duplicate = True
-                            break
-
-                    if not is_duplicate:
-                        current_embeddings.append(embedding)
-                        visitor_id = self.save_visitor(embedding)
-                        processed_count += 1
-
-                        # Отрисовка
-                        color = (0, 255, 0)
-                        cv2.rectangle(processed_frame, (x, y), (x + w, y + h), color, 2)
-                        cv2.putText(processed_frame, f'ID: {visitor_id}', (x, y - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                        cv2.putText(processed_frame, f'Visits: {self.get_visit_count(visitor_id)}',
-                                    (x, y + h + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            # Обрабатываем все лица
+            processed_count = self._process_multiple_faces(face_data, processed_frame)
 
             self.last_processing_time = current_time
             logger.info(
@@ -290,7 +319,7 @@ class VisitorCounter:
                     cv2.putText(processed_frame, text, (10, 25 + i * 25),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-                cv2.imshow('Visitor Analytics - FIXED DB', processed_frame)
+                cv2.imshow('Visitor Analytics - MULTI-FACE FIX', processed_frame)
 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     logger.info("Остановка по запросу пользователя")
@@ -318,14 +347,14 @@ class VisitorCounter:
 def main():
     """Основная функция"""
 
-    # Создаем счетчик с высоким порогом схожести
+    # Создаем счетчик с указанным порогом схожести
     counter = VisitorCounter(
-        processing_interval=0.5,
-        similarity_threshold=0.10  # Высокий порог для избежания дубликатов
+        processing_interval=0.3,  # Уменьшенный интервал для лучшей обработки
+        similarity_threshold=0.12  # Порог как requested
     )
 
     # Если нужно начать с чистого листа, раскомментируйте:
-    counter.cleanup_database()
+    # counter.cleanup_database()
 
     try:
         counter.start_analysis(0)
