@@ -1,14 +1,11 @@
-# video_analytics_trassir_lightweight.py
+# video_analytics_trassir_standalone.py
 import cv2
 import numpy as np
 import sqlite3
 import datetime
 import time
 import logging
-import threading
-from queue import Queue
 import os
-import mediapipe as mp
 
 # Настройка логирования
 logging.basicConfig(
@@ -22,12 +19,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class LightweightTrassirCounter:
-    def __init__(self, processing_interval=1.0, tracking_threshold=0.6):
+class StandaloneTrassirCounter:
+    def __init__(self, processing_interval=1.0, tracking_threshold=0.7):
         """
-        Облегченная версия без DeepFace, только MediaPipe + OpenCV
+        Автономная версия без внешних зависимостей (кроме OpenCV)
         """
-        self.conn = sqlite3.connect('visitors_trassir_lightweight.db', check_same_thread=False)
+        self.conn = sqlite3.connect('visitors_trassir_standalone.db', check_same_thread=False)
         self._init_database()
 
         self.processing_interval = processing_interval
@@ -49,13 +46,13 @@ class LightweightTrassirCounter:
         }
 
         # Папки для хранения фото
-        self.photos_dir = "visitor_photos_lightweight"
+        self.photos_dir = "visitor_photos_standalone"
         self.current_session_dir = "current_session"
         self._create_directories()
 
         # Трекинг состояния
         self.last_processing_time = 0
-        self.known_visitors = {}  # Простая структура для хранения известных лиц
+        self.known_visitors = {}
         self.next_visitor_id = 1
 
         # Система трекинга лиц
@@ -78,28 +75,33 @@ class LightweightTrassirCounter:
         }
         self.last_log_time = time.time()
 
-        # Инициализация MediaPipe
-        self.setup_mediapipe()
+        # Инициализация детекторов OpenCV
+        self.setup_opencv_detectors()
 
         # Для расчета FPS
         self.fps_start_time = time.time()
         self.fps_frame_count = 0
         self.current_fps = 0
 
-        logger.info("🎯 Облегченная система инициализирована (только MediaPipe)")
+        logger.info("🎯 Автономная система инициализирована (только OpenCV)")
 
-    def setup_mediapipe(self):
-        """Инициализация MediaPipe"""
+    def setup_opencv_detectors(self):
+        """Инициализация детекторов OpenCV"""
         try:
-            self.mp_face_detection = mp.solutions.face_detection
-            self.mp_drawing = mp.solutions.drawing_utils
-            self.face_detection = self.mp_face_detection.FaceDetection(
-                model_selection=0,  # 0 для ближних, 1 для дальних лиц
-                min_detection_confidence=0.5
+            # Основные каскады для детекции лиц
+            self.face_cascade = cv2.CascadeClassifier(
+                cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
             )
-            logger.info("✅ MediaPipe инициализирован для детекции лиц")
+            self.face_cascade_alt = cv2.CascadeClassifier(
+                cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml'
+            )
+            self.profile_cascade = cv2.CascadeClassifier(
+                cv2.data.haarcascades + 'haarcascade_profileface.xml'
+            )
+
+            logger.info("✅ Детекторы OpenCV инициализированы")
         except Exception as e:
-            logger.error(f"❌ Ошибка инициализации MediaPipe: {e}")
+            logger.error(f"❌ Ошибка инициализации детекторов: {e}")
             raise
 
     def _create_directories(self):
@@ -119,43 +121,68 @@ class LightweightTrassirCounter:
                 visit_count INTEGER DEFAULT 1,
                 last_updated TIMESTAMP,
                 photo_path TEXT,
-                track_features BLOB
+                facial_features BLOB
             )
         ''')
         self.conn.commit()
 
-    def detect_faces_mediapipe(self, frame):
-        """Детекция лиц с использованием MediaPipe"""
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.face_detection.process(rgb_frame)
+    def detect_faces_robust(self, frame):
+        """Надежная детекция лиц с использованием нескольких каскадов"""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        faces = []
-        if results.detections:
-            for detection in results.detections:
-                bbox = detection.location_data.relative_bounding_box
-                h, w = frame.shape[:2]
+        # Детекция фронтальных лиц
+        faces1 = self.face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=6,
+            minSize=(self.min_face_size, self.min_face_size),
+            flags=cv2.CASCADE_SCALE_IMAGE
+        )
 
-                x = int(bbox.xmin * w)
-                y = int(bbox.ymin * h)
-                width = int(bbox.width * w)
-                height = int(bbox.height * h)
+        faces2 = self.face_cascade_alt.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(self.min_face_size, self.min_face_size),
+            flags=cv2.CASCADE_SCALE_IMAGE
+        )
 
-                confidence = detection.score[0]
+        # Детекция профильных лиц
+        faces3 = self.profile_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(self.min_face_size, self.min_face_size),
+            flags=cv2.CASCADE_SCALE_IMAGE
+        )
 
-                # Фильтрация по уверенности и размеру
-                if (confidence >= self.min_confidence and
-                        width >= self.min_face_size and height >= self.min_face_size and
-                        width <= self.max_face_size and height <= self.max_face_size):
+        # Объединение и фильтрация результатов
+        all_faces = []
+        seen_positions = set()
 
-                    # Дополнительная проверка на валидность
-                    if self.is_valid_face_region(frame, x, y, width, height):
-                        faces.append({
-                            'coords': (x, y, width, height),
-                            'confidence': confidence,
-                            'keypoints': detection.location_data.relative_keypoints
-                        })
+        for faces in [faces1, faces2, faces3]:
+            for (x, y, w, h) in faces:
+                # Проверка размера
+                if w > self.max_face_size or h > self.max_face_size:
+                    continue
 
-        return faces
+                # Проверка на дубликаты (грубая группировка)
+                pos_key = (x // 20, y // 20, w // 20, h // 20)
+                if pos_key in seen_positions:
+                    continue
+
+                # Проверка валидности региона
+                if not self.is_valid_face_region(frame, x, y, w, h):
+                    continue
+
+                # Проверка что это похоже на лицо
+                face_roi = gray[y:y + h, x:x + w]
+                if self.is_likely_face(face_roi):
+                    all_faces.append((x, y, w, h))
+                    seen_positions.add(pos_key)
+
+        logger.info(f"🔍 Детекция: найдено {len(all_faces)} лиц")
+        return all_faces
 
     def is_valid_face_region(self, frame, x, y, w, h):
         """Проверка валидности региона лица"""
@@ -165,13 +192,45 @@ class LightweightTrassirCounter:
         if x < 0 or y < 0 or x + w > w_total or y + h > h_total:
             return False
 
-        # Проверка размера (относительно размера кадра)
-        if w < w_total * 0.05 or h < h_total * 0.05:  # Слишком маленький
+        # Проверка размера
+        if w < self.min_face_size or h < self.min_face_size:
             return False
-        if w > w_total * 0.4 or h > h_total * 0.4:  # Слишком большой
+        if w > self.max_face_size or h > self.max_face_size:
+            return False
+
+        # Проверка соотношения сторон
+        aspect_ratio = w / h
+        if aspect_ratio < 0.6 or aspect_ratio > 1.8:
             return False
 
         return True
+
+    def is_likely_face(self, face_roi):
+        """Проверка, что регион вероятнее всего является лицом"""
+        if face_roi.size == 0:
+            return False
+
+        h, w = face_roi.shape
+
+        # Проверка контраста (лица обычно имеют хороший контраст)
+        std_dev = np.std(face_roi)
+        if std_dev < 15:  # Слишком однородная текстура
+            return False
+
+        # Проверка симметрии (лица обычно симметричны)
+        left_half = face_roi[:, :w // 2]
+        right_half = face_roi[:, w // 2:]
+
+        # Зеркальное отражение правой половины для сравнения
+        right_flipped = cv2.flip(right_half, 1)
+
+        # Сравнение гистограмм
+        hist_left = cv2.calcHist([left_half], [0], None, [8], [0, 256])
+        hist_right = cv2.calcHist([right_flipped], [0], None, [8], [0, 256])
+
+        correlation = cv2.compareHist(hist_left, hist_right, cv2.HISTCMP_CORREL)
+
+        return correlation > 0.3  # Умеренная симметрия
 
     def validate_human_features(self, face_image):
         """Проверка что обнаруженный объект имеет характеристики человека"""
@@ -201,29 +260,36 @@ class LightweightTrassirCounter:
         except:
             return True  # Если не удалось проверить, даем шанс
 
-    def extract_simple_features(self, face_image):
-        """Извлечение простых признаков для трекинга без DeepFace"""
+    def extract_robust_features(self, face_image):
+        """Извлечение надежных признаков для трекинга"""
         try:
             # Ресайз для единообразия
-            resized = cv2.resize(face_image, (64, 64))
+            resized = cv2.resize(face_image, (100, 100))
 
-            # Конвертация в grayscale
+            # Конвертация в разные цветовые пространства
             gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+            hsv = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)
+            lab = cv2.cvtColor(resized, cv2.COLOR_BGR2LAB)
 
-            # Гистограмма градиентов (упрощенная версия)
-            gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0)
-            gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1)
-
-            mag, ang = cv2.cartToPolar(gx, gy)
-
-            # Упрощенные признаки: средняя яркость, контраст, гистограмма
             features = []
-            features.append(np.mean(gray))  # Средняя яркость
-            features.append(np.std(gray))  # Контраст
-            features.extend(np.histogram(gray, bins=8)[0])  # Гистограмма
+
+            # Гистограммы по каналам
+            for i, channel in enumerate([gray, hsv[:, :, 0], hsv[:, :, 1], lab[:, :, 0]]):
+                hist = cv2.calcHist([channel], [0], None, [16], [0, 256])
+                hist = cv2.normalize(hist, hist).flatten()
+                features.extend(hist)
+
+            # Текстура - локальный бинарный паттерн (упрощенный)
+            texture_features = self.extract_texture_features(gray)
+            features.extend(texture_features)
+
+            # Геометрические особенности
+            geometric_features = self.extract_geometric_features(gray)
+            features.extend(geometric_features)
+
+            features = np.array(features, dtype=np.float32)
 
             # Нормализация
-            features = np.array(features, dtype=np.float32)
             if np.linalg.norm(features) > 0:
                 features = features / np.linalg.norm(features)
 
@@ -232,8 +298,41 @@ class LightweightTrassirCounter:
             logger.warning(f"Ошибка извлечения признаков: {e}")
             return None
 
+    def extract_texture_features(self, gray_image):
+        """Извлечение текстурных признаков"""
+        # Упрощенный LBP (Local Binary Pattern)
+        h, w = gray_image.shape
+        texture_features = []
+
+        # Разделяем на регионы и вычисляем статистики
+        for i in range(0, h, 25):
+            for j in range(0, w, 25):
+                region = gray_image[i:min(i + 25, h), j:min(j + 25, w)]
+                if region.size > 0:
+                    texture_features.append(np.mean(region))
+                    texture_features.append(np.std(region))
+
+        return texture_features[:8]  # Ограничиваем количество признаков
+
+    def extract_geometric_features(self, gray_image):
+        """Извлечение геометрических признаков"""
+        features = []
+
+        # Градиенты
+        grad_x = cv2.Sobel(gray_image, cv2.CV_32F, 1, 0)
+        grad_y = cv2.Sobel(gray_image, cv2.CV_32F, 0, 1)
+
+        magnitude, angle = cv2.cartToPolar(grad_x, grad_y)
+
+        features.append(np.mean(magnitude))
+        features.append(np.std(magnitude))
+        features.append(np.mean(angle))
+        features.append(np.std(angle))
+
+        return features
+
     def calculate_feature_similarity(self, features1, features2):
-        """Расчет схожести на основе простых признаков"""
+        """Расчет схожести на основе признаков"""
         if features1 is None or features2 is None:
             return 0.0
 
@@ -257,7 +356,8 @@ class LightweightTrassirCounter:
             best_similarity = 0.0
 
             # Удаляем старые треки
-            for track_id in list(self.face_tracks.keys()):
+            current_tracks = list(self.face_tracks.keys())
+            for track_id in current_tracks:
                 if timestamp - self.face_tracks[track_id]['last_seen'] > self.track_max_age:
                     logger.debug(f"🗑️ Удален старый трек {track_id}")
                     del self.face_tracks[track_id]
@@ -328,7 +428,7 @@ class LightweightTrassirCounter:
         # Ищем лучшего кандидата среди известных
         visitor_id, similarity = self.find_best_match(features)
 
-        if similarity > 0.7:  # Более высокий порог для простых признаков
+        if similarity > 0.75:  # Высокий порог для надежности
             # Подтверждаем существующего посетителя
             track_data['visitor_id'] = visitor_id
             track_data['confirmed_at'] = timestamp
@@ -343,7 +443,7 @@ class LightweightTrassirCounter:
         else:
             # Ждем подтверждения для нового посетителя
             track_duration = timestamp - track_data['created_at']
-            if track_duration > 3.0:  # Увеличили время для более надежного трекинга
+            if track_duration > 4.0:  # Увеличили время для более надежного трекинга
                 new_visitor_id = self._create_new_visitor(features, face_image, track_id)
                 if new_visitor_id:
                     self.recognition_stats['new_visitors'] += 1
@@ -390,7 +490,7 @@ class LightweightTrassirCounter:
             features_blob = features.astype(np.float32).tobytes()
             cursor.execute(
                 """INSERT INTO visitors (first_seen, last_seen, visit_count, 
-                   last_updated, photo_path, track_features) 
+                   last_updated, photo_path, facial_features) 
                    VALUES (?, ?, 1, ?, ?, ?)""",
                 (now, now, now, photo_path, features_blob)
             )
@@ -436,7 +536,7 @@ class LightweightTrassirCounter:
                 scale = 200 / width
                 new_width = 200
                 new_height = int(height * scale)
-                photo_clean = cv2.resize(photo_clean, (new_width, new_height), interpolation=cv2.INTER_LANCZOS4)
+                photo_clean = cv2.resize(photo_clean, (new_width, new_height))
 
             filename = f"visitor_{visitor_id}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
             filepath = os.path.join(self.photos_dir, filename)
@@ -466,7 +566,7 @@ class LightweightTrassirCounter:
             cv2.putText(gallery_photo, f"ID: {visitor_id}", (10, gallery_photo.shape[0] - 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, border_color, 1)
 
-            gallery_photo = cv2.resize(gallery_photo, self.photo_size, interpolation=cv2.INTER_AREA)
+            gallery_photo = cv2.resize(gallery_photo, self.photo_size)
 
             self.current_visitors_gallery[visitor_id] = {
                 'photo': gallery_photo,
@@ -557,9 +657,7 @@ class LightweightTrassirCounter:
         new_width = target_width
         new_height = int(height * ratio)
 
-        resized_frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
-
-        return resized_frame
+        return cv2.resize(frame, (new_width, new_height))
 
     def log_recognition_stats(self):
         """Логирование статистики распознавания"""
@@ -589,7 +687,7 @@ class LightweightTrassirCounter:
             return frame, 0, 0, 0
 
         # Детекция лиц
-        detected_faces = self.detect_faces_mediapipe(frame)
+        detected_faces = self.detect_faces_robust(frame)
 
         processed_faces = []
         filtered_count = 0
@@ -598,23 +696,19 @@ class LightweightTrassirCounter:
             self.recognition_stats['total_detections'] += len(detected_faces)
             logger.info(f"👥 ОБНАРУЖЕНО ОБЪЕКТОВ: {len(detected_faces)}")
 
-            for face_data in detected_faces:
-                x, y, w, h = face_data['coords']
-
+            for (x, y, w, h) in detected_faces:
                 face_img = frame[y:y + h, x:x + w]
 
                 # Проверка характеристик человека
                 if not self.validate_human_features(face_img):
                     filtered_count += 1
-                    logger.debug("❌ Отфильтрован не-человеческий объект")
                     continue
 
-                features = self.extract_simple_features(face_img)
+                features = self.extract_robust_features(face_img)
                 if features is not None:
                     processed_faces.append({
                         'coords': (x, y, w, h),
                         'features': features,
-                        'confidence': face_data['confidence'],
                         'face_image': face_img,
                         'status': 'detected'
                     })
@@ -663,7 +757,6 @@ class LightweightTrassirCounter:
 
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         cap.set(cv2.CAP_PROP_FPS, 15)
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'H264'))
 
         # Пропускаем кадры для стабилизации
         for _ in range(10):
@@ -682,7 +775,7 @@ class LightweightTrassirCounter:
 
     def start_analysis(self, rtsp_url):
         """Запуск анализа"""
-        logger.info("🚀 Запуск облегченной версии с MediaPipe...")
+        logger.info("🚀 Запуск автономной версии (только OpenCV)...")
 
         cap = self.setup_rtsp_camera(rtsp_url)
         if not cap.isOpened():
@@ -690,7 +783,7 @@ class LightweightTrassirCounter:
 
         logger.info("✅ Анализ запущен")
 
-        window_name = 'Trassir Analytics - LIGHTWEIGHT (MediaPipe only)'
+        window_name = 'Trassir Analytics - STANDALONE (OpenCV only)'
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_name, 1600, 900)
 
@@ -708,7 +801,7 @@ class LightweightTrassirCounter:
 
                 # Статистика на экране
                 stats_text = [
-                    f"LIGHTWEIGHT ANALYTICS (MediaPipe)",
+                    f"STANDALONE ANALYTICS (OpenCV)",
                     f"Objects detected: {detected}",
                     f"Faces processed: {processed}",
                     f"Filtered: {filtered}",
@@ -725,7 +818,7 @@ class LightweightTrassirCounter:
                 for i, text in enumerate(stats_text):
                     color = (255, 255, 255)
                     if "Filtered" in text and filtered > 0:
-                        color = (0, 255, 255)  # Желтый для фильтрованных объектов
+                        color = (0, 255, 255)
                     cv2.putText(display_with_gallery, text, (10, 30 + i * 25),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
@@ -736,6 +829,8 @@ class LightweightTrassirCounter:
 
         except KeyboardInterrupt:
             logger.info("⏹️ Остановка по Ctrl+C...")
+        except Exception as e:
+            logger.error(f"❌ Ошибка во время анализа: {e}")
         finally:
             cap.release()
             cv2.destroyAllWindows()
@@ -753,9 +848,9 @@ def main():
     """Основная функция"""
     RTSP_URL = "rtsp://admin:admin@10.0.0.242:554/live/main"
 
-    counter = LightweightTrassirCounter(
+    counter = StandaloneTrassirCounter(
         processing_interval=1.0,
-        tracking_threshold=0.6
+        tracking_threshold=0.7
     )
 
     try:
