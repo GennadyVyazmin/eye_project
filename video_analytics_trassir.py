@@ -1,4 +1,4 @@
-# video_analytics_trassir_optimized.py
+# video_analytics_trassir_optimized_fixed.py
 import cv2
 import numpy as np
 import sqlite3
@@ -33,7 +33,7 @@ class OptimizedTrassirCounter:
         self.processing_active = False
 
         # Очередь для асинхронной обработки
-        self.frame_queue = Queue(maxsize=2)  # Ограничиваем очередь
+        self.frame_queue = Queue(maxsize=2)
         self.results_queue = Queue()
 
         # Загрузка детектора лиц
@@ -47,6 +47,11 @@ class OptimizedTrassirCounter:
         # Поток для обработки
         self.processing_thread = None
         self.stop_processing = False
+
+        # Для расчета FPS
+        self.fps_start_time = time.time()
+        self.fps_frame_count = 0
+        self.current_fps = 0
 
         logger.info(f"Оптимизированная инициализация завершена. Интервал: {processing_interval}с")
 
@@ -75,10 +80,12 @@ class OptimizedTrassirCounter:
         for visitor_id, embedding_blob in visitors:
             if embedding_blob:
                 try:
-                    embedding = np.frombuffer(embedding_blob, dtype=np.float64)
+                    embedding = np.frombuffer(embedding_blob, dtype=np.float32)
                     self.known_visitors_cache[visitor_id] = embedding
                 except Exception as e:
                     logger.warning(f"Ошибка загрузки посетителя {visitor_id}: {e}")
+
+        logger.info(f"Загружено посетителей: {len(self.known_visitors_cache)}")
 
     def start_processing_thread(self):
         """Запуск фонового потока обработки"""
@@ -109,7 +116,7 @@ class OptimizedTrassirCounter:
         try:
             # Сильно уменьшаем разрешение для обработки
             height, width = frame.shape[:2]
-            if width > 640:  # Уменьшаем до 640px для обработки
+            if width > 640:
                 scale = 640 / width
                 new_width = 640
                 new_height = int(height * scale)
@@ -142,7 +149,6 @@ class OptimizedTrassirCounter:
                     if 50 <= w_orig <= 400 and 50 <= h_orig <= 400:
                         face_img = frame[y_orig:y_orig + h_orig, x_orig:x_orig + w_orig]
 
-                        # Получаем эмбеддинг только для хороших лиц
                         embedding = self.get_fast_embedding(face_img)
                         if embedding is not None:
                             processed_faces.append({
@@ -164,38 +170,62 @@ class OptimizedTrassirCounter:
         """Быстрое получение эмбеддинга с оптимизацией"""
         try:
             # Сильное уменьшение для скорости
-            face_resized = cv2.resize(face_image, (96, 96))  # Было 224x224
+            face_resized = cv2.resize(face_image, (96, 96))
 
             # Минимальная предобработка
             face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
 
             result = DeepFace.represent(
                 face_rgb,
-                model_name='Facenet',  # Можно попробовать 'OpenFace' для скорости
+                model_name='Facenet',
                 enforce_detection=False,
-                detector_backend='skip',  # Пропускаем детекцию, т.к. уже есть лица
+                detector_backend='skip',
                 align=False
             )
 
-            return np.array(result[0]['embedding'], dtype=np.float32)  # float32 вместо float64
+            embedding = np.array(result[0]['embedding'], dtype=np.float32)
+
+            # Проверяем что эмбеддинг не нулевой
+            if np.all(embedding == 0):
+                return None
+
+            return embedding
 
         except Exception as e:
+            logger.debug(f"Ошибка получения эмбеддинга: {e}")
             return None
 
     def calculate_similarity(self, embedding1, embedding2):
-        """Быстрый расчет схожести"""
+        """Безопасный расчет схожести с проверкой нулевых векторов"""
         if embedding1 is None or embedding2 is None:
             return 0.0
 
         try:
-            emb1_norm = embedding1 / np.linalg.norm(embedding1)
-            emb2_norm = embedding2 / np.linalg.norm(embedding2)
-            return float(np.dot(emb1_norm, emb2_norm))
-        except:
+            # Проверяем на нулевые векторы
+            norm1 = np.linalg.norm(embedding1)
+            norm2 = np.linalg.norm(embedding2)
+
+            if norm1 == 0 or norm2 == 0:
+                return 0.0
+
+            # Нормализация и расчет схожести
+            emb1_norm = embedding1 / norm1
+            emb2_norm = embedding2 / norm2
+
+            similarity = float(np.dot(emb1_norm, emb2_norm))
+
+            # Ограничиваем значение между 0 и 1
+            return max(0.0, min(1.0, similarity))
+
+        except Exception as e:
+            logger.debug(f"Ошибка расчета схожести: {e}")
             return 0.0
 
     def find_best_match(self, embedding):
         """Поиск лучшего совпадения"""
+        if embedding is None:
+            return None, 0.0
+
         best_match_id = None
         best_similarity = 0.0
 
@@ -209,42 +239,58 @@ class OptimizedTrassirCounter:
 
     def save_visitor(self, embedding):
         """Сохранение посетителя"""
+        if embedding is None:
+            return None
+
         cursor = self.conn.cursor()
         now = datetime.datetime.now()
 
         visitor_id, similarity = self.find_best_match(embedding)
 
-        if similarity > self.similarity_threshold:
+        if similarity > self.similarity_threshold and visitor_id is not None:
+            # Обновление существующего
             cursor.execute(
-                "UPDATE visitors SET last_seen = ?, visit_count = visit_count + 1 WHERE id = ?",
-                (now, visitor_id)
+                "UPDATE visitors SET last_seen = ?, visit_count = visit_count + 1, last_updated = ? WHERE id = ?",
+                (now, now, visitor_id)
             )
-            logger.debug(f"Обновлен посетитель {visitor_id}")
+            logger.debug(f"Обновлен посетитель {visitor_id}, схожесть: {similarity:.3f}")
         else:
+            # Новый посетитель
             embedding_blob = embedding.astype(np.float32).tobytes()
             cursor.execute(
-                "INSERT INTO visitors (face_embedding, first_seen, last_seen, visit_count) VALUES (?, ?, ?, 1)",
-                (embedding_blob, now, now)
+                "INSERT INTO visitors (face_embedding, first_seen, last_seen, visit_count, last_updated) VALUES (?, ?, ?, 1, ?)",
+                (embedding_blob, now, now, now)
             )
             visitor_id = cursor.lastrowid
             self.known_visitors_cache[visitor_id] = embedding
-            logger.info(f"🆕 НОВЫЙ посетитель {visitor_id}")
+            logger.info(f"🆕 НОВЫЙ посетитель {visitor_id}, схожесть: {similarity:.3f}")
 
         self.conn.commit()
         return visitor_id
 
     def setup_rtsp_camera(self, rtsp_url):
         """Настройка RTSP с оптимизацией"""
+        logger.info(f"Подключение к камере: {rtsp_url}")
         cap = cv2.VideoCapture(rtsp_url)
 
         # ОПТИМИЗАЦИЯ: Уменьшаем качество потока для предпросмотра
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        cap.set(cv2.CAP_PROP_FPS, 10)  # Ограничиваем FPS
+        cap.set(cv2.CAP_PROP_FPS, 15)
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'H264'))
 
         # Пропускаем первые несколько кадров для стабилизации
-        for _ in range(10):
+        for _ in range(5):
             cap.read()
+
+        # Проверяем подключение
+        if cap.isOpened():
+            ret, test_frame = cap.read()
+            if ret:
+                logger.info(f"Камера подключена. Разрешение: {test_frame.shape[1]}x{test_frame.shape[0]}")
+            else:
+                logger.warning("Камера подключена, но не передает данные")
+        else:
+            logger.error("Не удалось подключиться к камере")
 
         return cap
 
@@ -252,18 +298,24 @@ class OptimizedTrassirCounter:
         """Обработка кадра в реальном времени (только отрисовка)"""
         current_time = time.time()
 
+        # Обновляем FPS
+        self.fps_frame_count += 1
+        if current_time - self.fps_start_time >= 1.0:
+            self.current_fps = self.fps_frame_count / (current_time - self.fps_start_time)
+            self.fps_frame_count = 0
+            self.fps_start_time = current_time
+
         # Обрабатываем только каждый N-ый кадр
         if current_time - self.last_processing_time < self.processing_interval:
             # Но проверяем есть ли результаты от фоновой обработки
             try:
                 result, frame_time = self.results_queue.get_nowait()
-                self._apply_processing_result(frame, result)
+                return self._apply_processing_result(frame, result)
             except:
-                pass
-            return frame, 0, 0
+                return frame, 0, 0
 
         # Отправляем кадр в фоновую обработку
-        if self.frame_queue.qsize() < 2:  # Не перегружаем очередь
+        if self.frame_queue.qsize() < 2:
             self.frame_queue.put((frame.copy(), current_time))
 
         self.last_processing_time = current_time
@@ -278,24 +330,28 @@ class OptimizedTrassirCounter:
     def _apply_processing_result(self, frame, result):
         """Применяет результаты обработки к кадру"""
         processed_frame = frame.copy()
+        processed_count = 0
 
         for face_data in result['faces']:
             x, y, w, h = face_data['coords']
             embedding = face_data['embedding']
 
             visitor_id = self.save_visitor(embedding)
-            best_match_id, similarity = self.find_best_match(embedding)
-            is_new = similarity <= self.similarity_threshold
+            if visitor_id is not None:
+                best_match_id, similarity = self.find_best_match(embedding)
+                is_new = similarity <= self.similarity_threshold or best_match_id is None
 
-            color = (0, 0, 255) if is_new else (0, 255, 0)
-            status = "NEW" if is_new else "KNOWN"
+                color = (0, 0, 255) if is_new else (0, 255, 0)
+                status = "NEW" if is_new else "KNOWN"
 
-            # Легкая отрисовка
-            cv2.rectangle(processed_frame, (x, y), (x + w, y + h), color, 2)
-            cv2.putText(processed_frame, f'{status}:{visitor_id}', (x, y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                # Легкая отрисовка
+                cv2.rectangle(processed_frame, (x, y), (x + w, y + h), color, 2)
+                cv2.putText(processed_frame, f'{status}:{visitor_id}', (x, y - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
-        return processed_frame, result['detected_count'], result['processed_count']
+                processed_count += 1
+
+        return processed_frame, result['detected_count'], processed_count
 
     def start_analysis(self, rtsp_url):
         """Запуск оптимизированного анализа"""
@@ -315,7 +371,7 @@ class OptimizedTrassirCounter:
             while True:
                 ret, frame = cap.read()
                 if not ret:
-                    logger.warning("Потеряно соединение...")
+                    logger.warning("Потеряно соединение с камерой...")
                     time.sleep(2)
                     continue
 
@@ -328,7 +384,7 @@ class OptimizedTrassirCounter:
                     f"Detected: {detected}",
                     f"Processed: {processed}",
                     f"Total: {len(self.known_visitors_cache)}",
-                    f"FPS: {self._calculate_fps()}",
+                    f"FPS: {self.current_fps:.1f}",
                     f"Queue: {self.frame_queue.qsize()}",
                     f"Press 'q' to quit"
                 ]
@@ -344,26 +400,17 @@ class OptimizedTrassirCounter:
                     break
 
         except KeyboardInterrupt:
-            logger.info("Остановка...")
+            logger.info("Остановка по Ctrl+C...")
+        except Exception as e:
+            logger.error(f"Ошибка в основном цикле: {e}")
         finally:
             self.stop_processing = True
+            if self.processing_thread:
+                self.processing_thread.join(timeout=2.0)
             cap.release()
             cv2.destroyAllWindows()
             self.conn.close()
             logger.info("Анализ завершен")
-
-    def _calculate_fps(self):
-        """Простой расчет FPS"""
-        self.frame_count += 1
-        if self.frame_count % 30 == 0:
-            current_time = time.time()
-            self.last_fps_time = getattr(self, 'last_fps_time', current_time)
-            self.last_fps_count = getattr(self, 'last_fps_count', 0)
-
-            fps = 30 / (current_time - self.last_fps_time)
-            self.last_fps_time = current_time
-            return f"{fps:.1f}"
-        return "calc..."
 
     def cleanup_database(self):
         """Очистка базы данных"""
@@ -380,7 +427,7 @@ def main():
 
     # Оптимизированные настройки
     counter = OptimizedTrassirCounter(
-        processing_interval=1.0,  # Увеличили интервал обработки
+        processing_interval=1.0,
         similarity_threshold=0.65
     )
 
