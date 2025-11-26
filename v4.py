@@ -1,4 +1,4 @@
-# video_analytics_trassir_realistic.py
+# video_analytics_trassir_realistic_fixed.py
 import cv2
 import numpy as np
 import sqlite3
@@ -11,6 +11,8 @@ from queue import Queue
 from collections import deque, defaultdict
 import os
 import shutil
+import math
+from threading import Lock
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -28,6 +30,11 @@ class RealisticTrassirCounter:
         self.processing_interval = processing_interval
         self.similarity_threshold = similarity_threshold
         self.tracking_threshold = tracking_threshold
+
+        # Мьютексы для потокобезопасности
+        self.stats_lock = Lock()
+        self.tracks_lock = Lock()
+        self.gallery_lock = Lock()
 
         # Цвета для индикации статусов
         self.COLORS = {
@@ -88,7 +95,7 @@ class RealisticTrassirCounter:
         self.last_log_time = time.time()
 
         # Очередь для обработки
-        self.frame_queue = Queue(maxsize=1)
+        self.frame_queue = Queue(maxsize=2)  # Ограничиваем очередь для избежания переполнения
         self.results_queue = Queue()
 
         # Детектор лиц с оптимизацией для дальнего расстояния
@@ -373,7 +380,9 @@ class RealisticTrassirCounter:
 
         logger.info(
             f"📊 МНОГОУРОВНЕВАЯ детекция: сырых {total_raw_detections}, принято {valid_count}, отклонено {rejected_count}")
-        self.recognition_stats['rejected_detections'] += rejected_count
+
+        with self.stats_lock:
+            self.recognition_stats['rejected_detections'] += rejected_count
 
         return all_faces
 
@@ -422,8 +431,350 @@ class RealisticTrassirCounter:
             logger.warning(f"❌ Ошибка получения эмбеддинга: {e}")
             return None
 
-    # ... остальные методы остаются аналогичными предыдущей версии
-    # (calculate_similarity, find_best_match, update_face_tracking и т.д.)
+    def calculate_similarity(self, embedding1, embedding2):
+        """Вычисление косинусного сходства между эмбеддингами"""
+        try:
+            if embedding1 is None or embedding2 is None:
+                return 0.0
+
+            # Нормализация векторов
+            norm1 = np.linalg.norm(embedding1)
+            norm2 = np.linalg.norm(embedding2)
+
+            if norm1 == 0 or norm2 == 0:
+                return 0.0
+
+            embedding1_norm = embedding1 / norm1
+            embedding2_norm = embedding2 / norm2
+
+            # Косинусное сходство
+            similarity = np.dot(embedding1_norm, embedding2_norm)
+
+            return float(similarity)
+        except Exception as e:
+            logger.warning(f"❌ Ошибка вычисления сходства: {e}")
+            return 0.0
+
+    def find_best_match(self, embedding):
+        """Поиск лучшего совпадения в базе данных"""
+        best_match_id = None
+        best_similarity = 0.0
+
+        for visitor_id, known_embedding in self.known_visitors_cache.items():
+            similarity = self.calculate_similarity(embedding, known_embedding)
+
+            if similarity > best_similarity and similarity >= self.similarity_threshold:
+                best_similarity = similarity
+                best_match_id = visitor_id
+
+        return best_match_id, best_similarity
+
+    def update_face_tracking(self, faces, current_time):
+        """Обновление системы трекинга лиц"""
+        active_tracks = {}
+
+        with self.tracks_lock:
+            # Очистка старых треков
+            for track_id, track_info in list(self.face_tracks.items()):
+                if current_time - track_info['last_seen'] > self.track_max_age:
+                    logger.info(f"🗑️ Удален старый трек {track_id}")
+                    del self.face_tracks[track_id]
+
+            # Обновление существующих треков
+            for face_bbox in faces:
+                x, y, w, h = face_bbox
+                face_center = (x + w // 2, y + h // 2)
+
+                best_track_id = None
+                best_distance = float('inf')
+
+                # Поиск ближайшего существующего трека
+                for track_id, track_info in self.face_tracks.items():
+                    if current_time - track_info['last_seen'] > 1.0:
+                        continue
+
+                    last_center = track_info['last_center']
+                    distance = math.sqrt((face_center[0] - last_center[0]) ** 2 +
+                                         (face_center[1] - last_center[1]) ** 2)
+
+                    # Пороговое расстояние для ассоциации
+                    max_distance = min(w, h) * 1.5
+
+                    if distance < best_distance and distance < max_distance:
+                        best_distance = distance
+                        best_track_id = track_id
+
+                if best_track_id is not None:
+                    # Обновление существующего трека
+                    self.face_tracks[best_track_id].update({
+                        'last_seen': current_time,
+                        'last_center': face_center,
+                        'bbox': face_bbox,
+                        'confirmed_count': self.face_tracks[best_track_id].get('confirmed_count', 0) + 1
+                    })
+                    active_tracks[best_track_id] = self.face_tracks[best_track_id]
+                else:
+                    # Создание нового трека
+                    track_id = self.next_track_id
+                    self.next_track_id += 1
+
+                    self.face_tracks[track_id] = {
+                        'first_seen': current_time,
+                        'last_seen': current_time,
+                        'last_center': face_center,
+                        'bbox': face_bbox,
+                        'confirmed_count': 1,
+                        'status': 'detected'
+                    }
+                    active_tracks[track_id] = self.face_tracks[track_id]
+                    logger.info(f"🆕 Создан новый трек {track_id}")
+
+        return active_tracks
+
+    def save_visitor_photo(self, face_image, visitor_id):
+        """Сохранение фото посетителя"""
+        try:
+            filename = f"visitor_{visitor_id}_{int(time.time())}.jpg"
+            filepath = os.path.join(self.photos_dir, self.current_session_dir, filename)
+
+            cv2.imwrite(filepath, face_image)
+            logger.info(f"📸 Сохранено фото: {filepath}")
+            return filepath
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения фото: {e}")
+            return None
+
+    def update_visitor_database(self, embedding, face_image, track_id):
+        """Обновление базы данных посетителей"""
+        try:
+            # Поиск совпадения
+            visitor_id, similarity = self.find_best_match(embedding)
+            current_time = datetime.datetime.now()
+
+            if visitor_id is not None:
+                # Известный посетитель
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE visitors 
+                    SET last_seen = ?, visit_count = visit_count + 1, last_updated = ?
+                    WHERE id = ?
+                ''', (current_time, current_time, visitor_id))
+                self.conn.commit()
+
+                with self.stats_lock:
+                    self.recognition_stats['known_visitors'] += 1
+
+                logger.info(f"👤 Обновлен известный посетитель {visitor_id} (сходство: {similarity:.3f})")
+                return visitor_id, 'known'
+            else:
+                # Новый посетитель
+                cursor = self.conn.cursor()
+                photo_path = self.save_visitor_photo(face_image, self.next_track_id)
+
+                cursor.execute('''
+                    INSERT INTO visitors 
+                    (face_embedding, first_seen, last_seen, last_updated, photo_path)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (embedding.tobytes(), current_time, current_time, current_time, photo_path))
+
+                new_visitor_id = cursor.lastrowid
+                self.conn.commit()
+
+                # Обновление кэша
+                self.known_visitors_cache[new_visitor_id] = embedding
+
+                with self.stats_lock:
+                    self.recognition_stats['new_visitors'] += 1
+
+                logger.info(f"🆕 Добавлен новый посетитель {new_visitor_id}")
+                return new_visitor_id, 'new'
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления БД: {e}")
+            return None, 'error'
+
+    def process_frame_realtime(self, frame):
+        """Обработка кадра в реальном времени"""
+        current_time = time.time()
+
+        # Обновление FPS
+        self.fps_frame_count += 1
+        if current_time - self.fps_start_time >= 1.0:
+            self.current_fps = self.fps_frame_count / (current_time - self.fps_start_time)
+            self.fps_start_time = current_time
+            self.fps_frame_count = 0
+
+        # Детекция лиц
+        faces = self.detect_faces_robust(frame)
+
+        # Обновление трекинга
+        active_tracks = self.update_face_tracking(faces, current_time)
+
+        # Отрисовка результатов
+        processed_frame = frame.copy()
+
+        detected_count = 0
+        processed_count = 0
+
+        for track_id, track_info in active_tracks.items():
+            x, y, w, h = track_info['bbox']
+
+            # Определение статуса для цвета
+            if track_info.get('visitor_id'):
+                status = 'known' if track_info.get('status') == 'known' else 'new'
+            elif track_info['confirmed_count'] >= self.false_positive_filter['required_confirmations']:
+                status = 'tracking'
+            else:
+                status = 'detected'
+
+            color = self.COLORS[status]
+
+            # Отрисовка bounding box
+            cv2.rectangle(processed_frame, (x, y), (x + w, y + h), color, 2)
+
+            # Текст с информацией
+            label = f"ID:{track_id} {status}"
+            if track_info.get('visitor_id'):
+                label += f" V:{track_info['visitor_id']}"
+
+            cv2.putText(processed_frame, label, (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+            detected_count += 1
+
+            # Обработка лица для распознавания (только для подтвержденных треков)
+            if (track_info['confirmed_count'] >= self.false_positive_filter['required_confirmations'] and
+                    current_time - track_info.get('last_processed', 0) > self.processing_interval):
+
+                try:
+                    face_roi = frame[y:y + h, x:x + w]
+                    embedding = self.get_fast_embedding(face_roi)
+
+                    if embedding is not None:
+                        visitor_id, status = self.update_visitor_database(embedding, face_roi, track_id)
+                        if visitor_id:
+                            track_info['visitor_id'] = visitor_id
+                            track_info['status'] = status
+                            processed_count += 1
+
+                    track_info['last_processed'] = current_time
+
+                except Exception as e:
+                    logger.error(f"❌ Ошибка обработки лица: {e}")
+
+        with self.stats_lock:
+            self.recognition_stats['total_detections'] += len(faces)
+            self.recognition_stats['valid_detections'] += detected_count
+            self.recognition_stats['frames_processed'] += 1
+
+        return processed_frame, detected_count, processed_count
+
+    def resize_frame_for_display(self, frame, target_width=1280):
+        """Изменение размера кадра для отображения"""
+        try:
+            h, w = frame.shape[:2]
+            if w <= target_width:
+                return frame
+
+            scale_factor = target_width / w
+            new_width = target_width
+            new_height = int(h * scale_factor)
+
+            return cv2.resize(frame, (new_width, new_height))
+        except Exception as e:
+            logger.error(f"❌ Ошибка изменения размера: {e}")
+            return frame
+
+    def create_gallery_display(self, main_frame):
+        """Создание отображения с галереей посетителей"""
+        try:
+            main_height, main_width = main_frame.shape[:2]
+
+            # Создание панели для галереи
+            gallery_height = 180
+            combined_width = main_width
+
+            # Создание комбинированного изображения
+            combined_frame = np.zeros((main_height + gallery_height, combined_width, 3), dtype=np.uint8)
+            combined_frame[0:main_height, 0:main_width] = main_frame
+
+            # Заголовок галереи
+            cv2.putText(combined_frame, "Current Visitors Gallery", (10, main_height + 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+            # Очистка старой галереи
+            current_time = time.time()
+            if current_time - self.last_gallery_cleanup > self.gallery_cleanup_interval:
+                with self.gallery_lock:
+                    self.current_visitors_gallery = {
+                        k: v for k, v in self.current_visitors_gallery.items()
+                        if current_time - v['last_seen'] < 300  # 5 минут
+                    }
+                self.last_gallery_cleanup = current_time
+
+            # Отрисовка галереи
+            gallery_x = 10
+            for track_id, visitor_info in list(self.current_visitors_gallery.items())[:8]:
+                if 'photo' in visitor_info:
+                    photo = visitor_info['photo']
+                    photo_resized = cv2.resize(photo, (120, 120))
+
+                    # Размещение фото в галерее
+                    y_start = main_height + 40
+                    y_end = y_start + 120
+                    x_end = gallery_x + 120
+
+                    if x_end < combined_width:
+                        combined_frame[y_start:y_end, gallery_x:gallery_x + 120] = photo_resized
+
+                        # Подпись
+                        label = f"ID:{visitor_info.get('visitor_id', track_id)}"
+                        cv2.putText(combined_frame, label, (gallery_x, main_height + 165),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+                        gallery_x += 130
+
+            return combined_frame
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания галереи: {e}")
+            return main_frame
+
+    def processing_worker(self):
+        """Рабочий поток для обработки кадров"""
+        logger.info("🔄 Запущен поток обработки")
+
+        while not self.stop_processing:
+            try:
+                # Получение кадра из очереди с таймаутом
+                frame_data = self.frame_queue.get(timeout=1.0)
+                if frame_data is None:
+                    break
+
+                frame, frame_time = frame_data
+
+                # Обработка кадра
+                processed_frame, detected, processed = self.process_frame_realtime(frame)
+
+                # Помещение результата в очередь
+                if not self.results_queue.full():
+                    self.results_queue.put((processed_frame, detected, processed))
+
+                self.frame_queue.task_done()
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка в потоке обработки: {e}")
+                time.sleep(0.1)
+
+        logger.info("🛑 Поток обработки остановлен")
+
+    def start_processing_thread(self):
+        """Запуск потока обработки"""
+        self.stop_processing = False
+        self.processing_thread = threading.Thread(target=self.processing_worker)
+        self.processing_thread.daemon = True
+        self.processing_thread.start()
+        logger.info("✅ Поток обработки запущен")
 
     def start_analysis(self, rtsp_url):
         """Запуск анализа с РЕАЛИСТИЧНЫМИ настройками"""
@@ -449,6 +800,7 @@ class RealisticTrassirCounter:
                     time.sleep(2)
                     continue
 
+                # Обработка кадра в основном потоке (упрощенная версия)
                 processed_frame, detected, processed = self.process_frame_realtime(frame)
                 display_frame = self.resize_frame_for_display(processed_frame, target_width=1280)
                 display_with_gallery = self.create_gallery_display(display_frame)
