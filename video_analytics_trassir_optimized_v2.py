@@ -1,4 +1,4 @@
-# video_analytics_trassir_optimized_v2_with_gui_scale.py
+# video_analytics_trassir_optimized_fixed_gui.py
 import cv2
 import numpy as np
 import sqlite3
@@ -16,10 +16,9 @@ logger = logging.getLogger(__name__)
 
 
 class OptimizedTrassirCounter:
-    def __init__(self, processing_interval=1.5, similarity_threshold=0.55, tracking_threshold=0.45,
-                 gui_scale=0.7, gui_max_width=1200):
+    def __init__(self, processing_interval=1.5, similarity_threshold=0.55, tracking_threshold=0.45):
         """
-        Версия с настройкой размера GUI окна
+        Версия с фиксированным нормальным размером GUI
         """
         self.conn = sqlite3.connect('visitors_trassir_opt_v2.db', check_same_thread=False)
         self._init_database()
@@ -27,10 +26,6 @@ class OptimizedTrassirCounter:
         self.processing_interval = processing_interval
         self.similarity_threshold = similarity_threshold
         self.tracking_threshold = tracking_threshold
-
-        # Настройки GUI
-        self.gui_scale = gui_scale  # Масштаб окна (0.5 = 50%, 1.0 = 100%)
-        self.gui_max_width = gui_max_width  # Максимальная ширина окна
 
         # Трекинг состояния
         self.last_processing_time = 0
@@ -72,7 +67,7 @@ class OptimizedTrassirCounter:
         self.fps_frame_count = 0
         self.current_fps = 0
 
-        logger.info(f"Улучшенная инициализация. GUI масштаб: {gui_scale}, Макс.ширина: {gui_max_width}")
+        logger.info(f"Улучшенная инициализация с нормальным GUI")
 
     def _init_database(self):
         """Инициализация базы данных"""
@@ -107,25 +102,21 @@ class OptimizedTrassirCounter:
 
         logger.info(f"📊 Загружено посетителей из базы: {len(self.known_visitors_cache)}")
 
-    def resize_frame_for_display(self, frame):
-        """Изменение размера кадра для отображения в GUI"""
-        if self.gui_scale == 1.0 and frame.shape[1] <= self.gui_max_width:
-            return frame
-
+    def resize_frame_for_display(self, frame, target_width=1280):
+        """Умное изменение размера кадра для отображения"""
         height, width = frame.shape[:2]
 
-        # Вычисляем новые размеры
-        new_width = int(width * self.gui_scale)
-        new_height = int(height * self.gui_scale)
+        # Если изображение уже меньше целевой ширины, не уменьшаем
+        if width <= target_width:
+            return frame
 
-        # Ограничиваем максимальной шириной
-        if new_width > self.gui_max_width:
-            scale = self.gui_max_width / new_width
-            new_width = self.gui_max_width
-            new_height = int(new_height * scale)
+        # Рассчитываем новые размеры с сохранением пропорций
+        ratio = target_width / width
+        new_width = target_width
+        new_height = int(height * ratio)
 
-        # Ресайз с интерполяцией для качества
-        resized_frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
+        # Ресайз с хорошей интерполяцией
+        resized_frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
 
         return resized_frame
 
@@ -437,9 +428,7 @@ class OptimizedTrassirCounter:
         if cap.isOpened():
             ret, test_frame = cap.read()
             if ret:
-                original_size = f"{test_frame.shape[1]}x{test_frame.shape[0]}"
-                display_size = f"{int(test_frame.shape[1] * self.gui_scale)}x{int(test_frame.shape[0] * self.gui_scale)}"
-                logger.info(f"✅ Камера подключена. Оригинал: {original_size}, GUI: {display_size}")
+                logger.info(f"✅ Камера подключена. Разрешение: {test_frame.shape[1]}x{test_frame.shape[0]}")
         else:
             logger.error("❌ Не удалось подключиться к камере")
 
@@ -491,11 +480,11 @@ class OptimizedTrassirCounter:
                 color = (0, 0, 255) if is_new else (0, 255, 0)
                 status = "NEW" if is_new else "KNOWN"
 
-                cv2.rectangle(processed_frame, (x, y), (x + w, y + h), color, 2)
+                cv2.rectangle(processed_frame, (x, y), (x + w, y + h), color, 3)
                 cv2.putText(processed_frame, f'{status}:{visitor_id}', (x, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
                 cv2.putText(processed_frame, f'Sim:{face_data["similarity"]:.2f}',
-                            (x, y + h + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                            (x, y + h + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
                 processed_count += 1
 
@@ -504,8 +493,8 @@ class OptimizedTrassirCounter:
         return processed_frame, result['detected_count'], processed_count
 
     def start_analysis(self, rtsp_url):
-        """Запуск анализа с настраиваемым GUI"""
-        logger.info("🚀 Запуск версии с настраиваемым размером GUI...")
+        """Запуск анализа с нормальным размером GUI"""
+        logger.info("🚀 Запуск версии с нормальным GUI...")
 
         cap = self.setup_rtsp_camera(rtsp_url)
         if not cap.isOpened():
@@ -515,9 +504,12 @@ class OptimizedTrassirCounter:
 
         logger.info("✅ Анализ запущен")
 
-        # Создаем окно с возможностью изменения размера
-        window_name = f'Trassir Analytics - Scale: {self.gui_scale}'
+        # Создаем окно нормального размера
+        window_name = 'Trassir Visitor Analytics - NORMAL SIZE'
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+        # Устанавливаем начальный размер окна
+        cv2.resizeWindow(window_name, 1280, 720)
 
         try:
             while True:
@@ -529,16 +521,12 @@ class OptimizedTrassirCounter:
 
                 processed_frame, detected, processed = self.process_frame_realtime(frame)
 
-                # Изменяем размер для отображения
-                display_frame = self.resize_frame_for_display(processed_frame)
+                # Умное масштабирование только если изображение слишком большое
+                display_frame = self.resize_frame_for_display(processed_frame, target_width=1280)
 
-                # Статистика на экране (масштабируем текст)
-                scale_factor = display_frame.shape[1] / processed_frame.shape[1]
-                font_scale = 0.5 * scale_factor
-                thickness = max(1, int(1 * scale_factor))
-
+                # Статистика на экране с читаемыми размерами
                 stats_text = [
-                    f"TRASSIR - GUI Scale: {self.gui_scale}",
+                    f"TRASSIR VISITOR ANALYTICS",
                     f"Detected: {detected}",
                     f"Processed: {processed}",
                     f"Total in DB: {len(self.known_visitors_cache)}",
@@ -547,9 +535,14 @@ class OptimizedTrassirCounter:
                     f"Press 'q' to quit"
                 ]
 
+                # Фон для текста для лучшей читаемости
+                overlay = display_frame.copy()
+                cv2.rectangle(overlay, (0, 0), (450, 180), (0, 0, 0), -1)
+                cv2.addWeighted(overlay, 0.7, display_frame, 0.3, 0, display_frame)
+
                 for i, text in enumerate(stats_text):
-                    cv2.putText(display_frame, text, (10, int(30 + i * 25 * scale_factor)),
-                                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
+                    cv2.putText(display_frame, text, (10, 30 + i * 25),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
                 cv2.imshow(window_name, display_frame)
 
@@ -583,20 +576,14 @@ class OptimizedTrassirCounter:
 
 
 def main():
-    """Основная функция с настройками GUI"""
+    """Основная функция"""
     RTSP_URL = "rtsp://admin:admin@10.0.0.242:554/live/main"
 
-    # НАСТРОЙКИ ГРАФИЧЕСКОГО ИНТЕРФЕЙСА:
-    GUI_SCALE = 0.9  # 0.6 = 60% от оригинального размера (0.1-1.0)
-    GUI_MAX_WIDTH = 2000  # Максимальная ширина окна в пикселях
-
-    # Улучшенные настройки
+    # Простые настройки
     counter = OptimizedTrassirCounter(
         processing_interval=1.5,
         similarity_threshold=0.55,
-        tracking_threshold=0.45,
-        gui_scale=GUI_SCALE,
-        gui_max_width=GUI_MAX_WIDTH
+        tracking_threshold=0.45
     )
 
     # counter.cleanup_database()
