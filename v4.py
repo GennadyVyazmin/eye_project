@@ -1,4 +1,4 @@
-# video_analytics_trassir_improved.py
+# video_analytics_trassir_complete.py
 import cv2
 import numpy as np
 import sqlite3
@@ -26,7 +26,7 @@ class ImprovedTrassirCounter:
         self._init_database()
 
         self.processing_interval = processing_interval
-        self.similarity_threshold = similarity_threshold  # Повысили порог
+        self.similarity_threshold = similarity_threshold
         self.tracking_threshold = tracking_threshold
 
         # Цвета для индикации статусов
@@ -52,25 +52,25 @@ class ImprovedTrassirCounter:
         # Система трекинга лиц
         self.face_tracks = {}
         self.next_track_id = 1
-        self.track_max_age = 8.0  # Увеличили время жизни трека
+        self.track_max_age = 8.0
 
         # Галерея текущих посетителей с автоочисткой
         self.current_visitors_gallery = {}
         self.gallery_max_size = 8
-        self.gallery_cleanup_interval = 60.0  # Очистка через 60 секунд
+        self.gallery_cleanup_interval = 60.0
         self.last_gallery_cleanup = time.time()
         self.photo_size = (120, 160)
 
         # Фильтрация ложных срабатываний
         self.false_positive_filter = {
-            'min_face_ratio': 0.08,  # Минимальное отношение лица к кадру
-            'max_face_ratio': 0.40,  # Максимальное отношение лица к кадру
-            'min_aspect_ratio': 0.7,  # Минимальное соотношение сторон
-            'max_aspect_ratio': 1.4,  # Максимальное соотношение сторон
-            'min_brightness': 30,  # Минимальная яркость
-            'max_brightness': 220,  # Максимальная яркость
-            'edge_threshold': 50,  # Порог четкости (лапласиан)
-            'required_confirmations': 3  # Требуемое количество подтверждений
+            'min_face_ratio': 0.08,
+            'max_face_ratio': 0.40,
+            'min_aspect_ratio': 0.7,
+            'max_aspect_ratio': 1.4,
+            'min_brightness': 30,
+            'max_brightness': 220,
+            'edge_threshold': 50,
+            'required_confirmations': 3
         }
 
         # Статистика
@@ -93,7 +93,6 @@ class ImprovedTrassirCounter:
             cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
         )
 
-        # Дополнительные детекторы для лучшего покрытия
         self.alt_face_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml'
         )
@@ -153,6 +152,31 @@ class ImprovedTrassirCounter:
 
         logger.info(f"📊 Загружено посетителей: {len(self.known_visitors_cache)}")
 
+    def setup_rtsp_camera(self, rtsp_url):
+        """Настройка RTSP подключения"""
+        logger.info(f"📡 Подключение к камере: {rtsp_url}")
+        cap = cv2.VideoCapture(rtsp_url)
+
+        # Оптимизация для RTSP
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FPS, 15)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'H264'))
+
+        # Пропускаем кадры для стабилизации
+        for _ in range(10):
+            cap.read()
+
+        if cap.isOpened():
+            ret, test_frame = cap.read()
+            if ret:
+                logger.info(f"✅ Камера подключена. Разрешение: {test_frame.shape[1]}x{test_frame.shape[0]}")
+            else:
+                logger.error("❌ Камера не передает данные")
+        else:
+            logger.error("❌ Не удалось подключиться к камере")
+
+        return cap
+
     def analyze_face_quality(self, face_image, bbox, frame_size):
         """Анализ качества обнаруженного лица"""
         try:
@@ -189,7 +213,7 @@ class ImprovedTrassirCounter:
             if laplacian_var < self.false_positive_filter['edge_threshold']:
                 return False, "Нечеткое изображение"
 
-            # 5. Проверка заполненности области (избегаем пустых регионов)
+            # 5. Проверка заполненности области
             if np.std(gray_face) < 10:
                 return False, "Слишком однородная область"
 
@@ -203,15 +227,14 @@ class ImprovedTrassirCounter:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         frame_size = gray.shape
 
-        # Пробуем разные параметры детекции
         all_faces = []
 
-        # Основной детектор с строгими параметрами
+        # Основной детектор
         faces1 = self.face_cascade.detectMultiScale(
             gray,
-            scaleFactor=1.05,  # Более точный поиск
-            minNeighbors=6,  # Меньше ложных срабатываний
-            minSize=(60, 60),  # Больший минимальный размер
+            scaleFactor=1.05,
+            minNeighbors=6,
+            minSize=(60, 60),
             maxSize=(300, 300),
             flags=cv2.CASCADE_SCALE_IMAGE
         )
@@ -255,10 +278,7 @@ class ImprovedTrassirCounter:
     def get_quality_embedding(self, face_image):
         """Получение эмбеддинга с проверкой качества"""
         try:
-            # Увеличиваем размер для лучшего качества
             face_resized = cv2.resize(face_image, (160, 160))
-
-            # Улучшенная предобработка
             face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
 
             # Нормализация контраста
@@ -274,12 +294,11 @@ class ImprovedTrassirCounter:
                 model_name='Facenet',
                 enforce_detection=False,
                 detector_backend='opencv',
-                align=True  # Включаем выравнивание
+                align=True
             )
 
             embedding = np.array(result[0]['embedding'], dtype=np.float32)
 
-            # Проверка качества эмбеддинга
             if np.all(embedding == 0) or np.linalg.norm(embedding) < 0.1:
                 logger.warning("❌ Низкое качество эмбеддинга")
                 return None
@@ -447,7 +466,7 @@ class ImprovedTrassirCounter:
         else:
             # Создаем нового посетителя
             track_duration = timestamp - track_data['created_at']
-            if track_duration > 3.0:  # Увеличили минимальное время трекинга
+            if track_duration > 3.0:
                 new_visitor_id = self._create_new_visitor(embedding, face_image, track_id)
                 if new_visitor_id:
                     self.recognition_stats['new_visitors'] += 1
@@ -467,7 +486,7 @@ class ImprovedTrassirCounter:
         try:
             embedding_blob = embedding.astype(np.float32).tobytes()
 
-            # Сохраняем фото
+            # Создаем временное фото для получения ID
             photo_path = self.save_visitor_photo(face_image, "temp")
 
             cursor.execute(
@@ -618,8 +637,54 @@ class ImprovedTrassirCounter:
             logger.error(f"Ошибка создания галереи: {e}")
             return main_frame
 
-    # ... остальные методы (resize_frame_for_display, log_recognition_stats и т.д.)
-    # аналогичны предыдущей версии, но с обновленной статистикой
+    def resize_frame_for_display(self, frame, target_width=1280):
+        """Изменение размера кадра для отображения"""
+        height, width = frame.shape[:2]
+
+        if width <= target_width:
+            return frame
+
+        ratio = target_width / width
+        new_width = target_width
+        new_height = int(height * ratio)
+
+        resized_frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+
+        return resized_frame
+
+    def log_recognition_stats(self):
+        """Логирование статистики распознавания"""
+        current_time = time.time()
+        if current_time - self.last_log_time >= 3.0:
+            logger.info(f"📊 СТАТИСТИКА: Всего в базе: {len(self.known_visitors_cache)}, "
+                        f"Активных треков: {len(self.face_tracks)}, "
+                        f"В галерее: {len(self.current_visitors_gallery)}, "
+                        f"Новых за сессию: {self.recognition_stats['new_visitors']}, "
+                        f"Известных: {self.recognition_stats['known_visitors']}, "
+                        f"Отклонено: {self.recognition_stats['rejected_detections']}")
+            self.last_log_time = current_time
+
+    def start_processing_thread(self):
+        """Запуск фонового потока обработки"""
+        self.stop_processing = False
+        self.processing_thread = threading.Thread(target=self._processing_worker, daemon=True)
+        self.processing_thread.start()
+        logger.info("Фоновый поток обработки запущен")
+
+    def _processing_worker(self):
+        """Фоновая обработка кадров"""
+        while not self.stop_processing:
+            try:
+                frame_data = self.frame_queue.get(timeout=1.0)
+                frame, frame_time = frame_data
+
+                result = self._process_frame_heavy(frame)
+                self.results_queue.put((result, frame_time))
+
+                self.frame_queue.task_done()
+
+            except:
+                continue
 
     def _process_frame_heavy(self, frame):
         """Тяжелые операции обработки с улучшенной фильтрацией"""
@@ -662,6 +727,72 @@ class ImprovedTrassirCounter:
         except Exception as e:
             logger.error(f"❌ Ошибка в фоновой обработке: {e}")
             return {'faces': [], 'processed_count': 0, 'detected_count': 0}
+
+    def process_frame_realtime(self, frame):
+        """Обработка кадра в реальном времени"""
+        current_time = time.time()
+
+        # Обновляем FPS
+        self.fps_frame_count += 1
+        if current_time - self.fps_start_time >= 1.0:
+            self.current_fps = self.fps_frame_count / (current_time - self.fps_start_time)
+            self.fps_frame_count = 0
+            self.fps_start_time = current_time
+
+        # Обрабатываем с интервалом
+        if current_time - self.last_processing_time < self.processing_interval:
+            try:
+                result, frame_time = self.results_queue.get_nowait()
+                return self._apply_processing_result(frame, result, current_time)
+            except:
+                return frame, 0, 0
+
+        # Отправляем в фоновую обработку
+        if self.frame_queue.empty():
+            self.frame_queue.put((frame.copy(), current_time))
+
+        self.last_processing_time = current_time
+
+        # Пробуем получить результаты
+        try:
+            result, frame_time = self.results_queue.get_nowait()
+            return self._apply_processing_result(frame, result, current_time)
+        except:
+            return frame, 0, 0
+
+    def _apply_processing_result(self, frame, result, current_time):
+        """Применяет результаты обработки"""
+        processed_frame = frame.copy()
+        processed_count = 0
+
+        # Обновляем трекинг
+        tracked_faces = self.update_face_tracking(result['faces'], current_time)
+
+        for face_data in tracked_faces:
+            visitor_id = self.confirm_visitor_identity(face_data['track_id'], face_data)
+
+            x, y, w, h = face_data['coords']
+            status = face_data.get('status', 'detected')
+
+            color = self.get_color_by_status(status)
+            status_text = self.get_status_text(status)
+
+            # Отрисовка рамки
+            cv2.rectangle(processed_frame, (x, y), (x + w, y + h), color, 3)
+            cv2.putText(processed_frame, f'{status_text}', (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+            if visitor_id:
+                cv2.putText(processed_frame, f'ID: {visitor_id}', (x, y + h + 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                cv2.putText(processed_frame, f'Sim: {face_data["similarity"]:.2f}',
+                            (x, y + h + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+            processed_count += 1
+
+        self.log_recognition_stats()
+
+        return processed_frame, result['detected_count'], processed_count
 
     def start_analysis(self, rtsp_url):
         """Запуск анализа"""
@@ -739,7 +870,7 @@ def main():
 
     counter = ImprovedTrassirCounter(
         processing_interval=1.0,
-        similarity_threshold=0.65,  # Повышенный порог
+        similarity_threshold=0.65,
         tracking_threshold=0.50
     )
 
