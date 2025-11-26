@@ -1,4 +1,4 @@
-# video_analytics_trassir_deepsort.py
+# video_analytics_trassir_simple_fixed.py
 import cv2
 import numpy as np
 import sqlite3
@@ -12,47 +12,22 @@ from collections import deque, defaultdict
 import os
 import shutil
 
-# Попробуем импортировать DeepSORT
-try:
-    from deep_sort_realtime import DeepSort
-
-    DEEPSORT_AVAILABLE = True
-    logger.info("✅ DeepSORT доступен")
-except ImportError:
-    DEEPSORT_AVAILABLE = False
-    logger.warning("❌ DeepSORT не установлен. Используем базовый трекинг")
-
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-class AdvancedTrassirCounter:
+class SimpleTrassirCounter:
     def __init__(self, processing_interval=1.0, similarity_threshold=0.55, tracking_threshold=0.45):
         """
-        Продвинутая версия с DeepSORT для трекинга по внешности
+        Упрощенная и надежная версия
         """
-        self.conn = sqlite3.connect('visitors_trassir_advanced.db', check_same_thread=False)
+        self.conn = sqlite3.connect('visitors_trassir_simple.db', check_same_thread=False)
         self._init_database()
 
         self.processing_interval = processing_interval
         self.similarity_threshold = similarity_threshold
         self.tracking_threshold = tracking_threshold
-
-        # Инициализация DeepSORT
-        self.deepsort = None
-        if DEEPSORT_AVAILABLE:
-            try:
-                self.deepsort = DeepSort(
-                    max_age=30,  # Максимальное время жизни трека без обновления
-                    n_init=3,  # Количество кадров для инициализации трека
-                    max_cosine_distance=0.4,  # Максимальное косинусное расстояние для ассоциации
-                    nn_budget=100  # Бюджет нейросети для внешних признаков
-                )
-                logger.info("🚀 DeepSORT инициализирован для трекинга по внешности")
-            except Exception as e:
-                logger.error(f"❌ Ошибка инициализации DeepSORT: {e}")
-                self.deepsort = None
 
         # Цвета для индикации статусов
         self.COLORS = {
@@ -60,12 +35,11 @@ class AdvancedTrassirCounter:
             'tracking': (255, 255, 0),  # Желтый - создан трек
             'known': (0, 255, 255),  # Голубой - известный пользователь
             'new': (0, 0, 255),  # Красный - новый пользователь в БД
-            'analyzing': (255, 165, 0),  # Оранжевый - анализ в процессе
-            'deepsort': (255, 0, 255)  # Пурпурный - трекинг DeepSORT
+            'analyzing': (255, 165, 0)  # Оранжевый - анализ в процессе
         }
 
         # Папки для хранения фото
-        self.photos_dir = "visitor_photos_advanced"
+        self.photos_dir = "visitor_photos_simple"
         self.current_session_dir = "current_session"
         self._create_directories()
 
@@ -74,9 +48,8 @@ class AdvancedTrassirCounter:
         self.known_visitors_cache = {}
         self.frame_count = 0
 
-        # Комбинированная система трекинга
+        # Система трекинга лиц
         self.face_tracks = {}
-        self.deepsort_tracks = {}
         self.next_track_id = 1
         self.track_max_age = 5.0
 
@@ -90,8 +63,7 @@ class AdvancedTrassirCounter:
             'total_detections': 0,
             'new_visitors': 0,
             'known_visitors': 0,
-            'deepsort_matches': 0,
-            'face_only_matches': 0
+            'frames_processed': 0
         }
         self.last_log_time = time.time()
 
@@ -99,9 +71,14 @@ class AdvancedTrassirCounter:
         self.frame_queue = Queue(maxsize=1)
         self.results_queue = Queue()
 
-        # Детектор лиц
+        # Детектор лиц - пробуем разные каскады
         self.face_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        )
+
+        # Альтернативный детектор
+        self.alt_face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml'
         )
 
         # Предзагрузка известных посетителей
@@ -116,12 +93,13 @@ class AdvancedTrassirCounter:
         self.fps_frame_count = 0
         self.current_fps = 0
 
-        logger.info(f"Продвинутая инициализация с DeepSORT: {DEEPSORT_AVAILABLE}")
+        logger.info("🎯 Упрощенная система инициализирована")
 
     def _create_directories(self):
         """Создание папок для хранения фото"""
         os.makedirs(self.photos_dir, exist_ok=True)
         os.makedirs(os.path.join(self.photos_dir, self.current_session_dir), exist_ok=True)
+        logger.info(f"📁 Созданы папки для фото: {self.photos_dir}")
 
     def _init_database(self):
         """Инициализация базы данных"""
@@ -135,8 +113,7 @@ class AdvancedTrassirCounter:
                 visit_count INTEGER DEFAULT 1,
                 last_updated TIMESTAMP,
                 confirmed_count INTEGER DEFAULT 1,
-                photo_path TEXT,
-                appearance_features BLOB
+                photo_path TEXT
             )
         ''')
         self.conn.commit()
@@ -144,229 +121,84 @@ class AdvancedTrassirCounter:
     def _load_known_visitors(self):
         """Загрузка известных посетителей"""
         cursor = self.conn.cursor()
-        cursor.execute("SELECT id, face_embedding, photo_path, appearance_features FROM visitors")
+        cursor.execute("SELECT id, face_embedding, photo_path FROM visitors")
         visitors = cursor.fetchall()
 
         self.known_visitors_cache.clear()
-        for visitor_id, embedding_blob, photo_path, appearance_blob in visitors:
+        for visitor_id, embedding_blob, photo_path in visitors:
             if embedding_blob:
                 try:
                     embedding = np.frombuffer(embedding_blob, dtype=np.float32)
-                    appearance_features = np.frombuffer(appearance_blob, dtype=np.float32) if appearance_blob else None
-
-                    self.known_visitors_cache[visitor_id] = {
-                        'embedding': embedding,
-                        'photo_path': photo_path,
-                        'appearance_features': appearance_features
-                    }
+                    self.known_visitors_cache[visitor_id] = embedding
                 except Exception as e:
                     logger.warning(f"Ошибка загрузки посетителя {visitor_id}: {e}")
 
         logger.info(f"📊 Загружено посетителей: {len(self.known_visitors_cache)}")
 
-    def extract_appearance_features(self, full_body_image):
-        """Извлечение признаков внешности (одежда, телосложение)"""
-        try:
-            if not DEEPSORT_AVAILABLE or self.deepsort is None:
-                return None
+    def detect_faces_robust(self, frame):
+        """Надежная детекция лиц с разными каскадами"""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            # DeepSORT автоматически извлекает признаки при детекции
-            # Здесь мы можем добавить дополнительную обработку
-            height, width = full_body_image.shape[:2]
+        # Пробуем основной каскад
+        faces1 = self.face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(50, 50),
+            maxSize=(400, 400),
+            flags=cv2.CASCADE_SCALE_IMAGE
+        )
 
-            # Простые гистограммы цвета как дополнительные признаки
-            hsv = cv2.cvtColor(full_body_image, cv2.COLOR_BGR2HSV)
-            hist_hue = cv2.calcHist([hsv], [0], None, [8], [0, 180])
-            hist_sat = cv2.calcHist([hsv], [1], None, [4], [0, 256])
-            hist_val = cv2.calcHist([hsv], [2], None, [4], [0, 256])
+        # Пробуем альтернативный каскад
+        faces2 = self.alt_face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=4,
+            minSize=(40, 40),
+            maxSize=(400, 400),
+            flags=cv2.CASCADE_SCALE_IMAGE
+        )
 
-            # Нормализация гистограмм
-            hist_hue = cv2.normalize(hist_hue, hist_hue).flatten()
-            hist_sat = cv2.normalize(hist_sat, hist_sat).flatten()
-            hist_val = cv2.normalize(hist_val, hist_val).flatten()
+        # Объединяем результаты
+        all_faces = []
+        face_set = set()
 
-            # Объединяем все признаки
-            appearance_features = np.concatenate([hist_hue, hist_sat, hist_val])
-            return appearance_features.astype(np.float32)
-
-        except Exception as e:
-            logger.debug(f"Ошибка извлечения признаков внешности: {e}")
-            return None
-
-    def calculate_appearance_similarity(self, features1, features2):
-        """Расчет схожести по внешним признакам"""
-        if features1 is None or features2 is None:
-            return 0.0
-
-        try:
-            # Косинусная схожесть для гистограмм
-            norm1 = np.linalg.norm(features1)
-            norm2 = np.linalg.norm(features2)
-
-            if norm1 == 0 or norm2 == 0:
-                return 0.0
-
-            similarity = np.dot(features1, features2) / (norm1 * norm2)
-            return float(similarity)
-
-        except Exception as e:
-            logger.debug(f"Ошибка расчета схожести внешности: {e}")
-            return 0.0
-
-    def process_with_deepsort(self, frame, faces):
-        """Обработка кадра с DeepSORT"""
-        if not DEEPSORT_AVAILABLE or self.deepsort is None:
-            return []
-
-        try:
-            # Подготавливаем детекции для DeepSORT
-            detections = []
+        for faces in [faces1, faces2]:
             for (x, y, w, h) in faces:
-                # Расширяем bounding box для захвата большего участка тела
-                expansion = 0.3  # 30% расширение
-                x_exp = max(0, int(x - w * expansion))
-                y_exp = max(0, int(y - h * expansion))
-                w_exp = min(frame.shape[1] - x_exp, int(w * (1 + 2 * expansion)))
-                h_exp = min(frame.shape[0] - y_exp, int(h * (1 + 2 * expansion)))
+                # Проверяем на дубликаты
+                face_key = (x // 10, y // 10, w // 10, h // 10)  # Грубая группировка
+                if face_key not in face_set:
+                    face_set.add(face_key)
+                    all_faces.append((x, y, w, h))
 
-                confidence = 0.9  # Высокая уверенность для лиц
-                detections.append(([x_exp, y_exp, w_exp, h_exp], confidence, None))
+        logger.info(f"🔍 Детекция: основной {len(faces1)}, альтернативный {len(faces2)}, итого {len(all_faces)}")
+        return all_faces
 
-            # Обновляем треки DeepSORT
-            tracks = self.deepsort.update_tracks(detections, frame=frame)
+    def get_fast_embedding(self, face_image):
+        """Быстрое получение эмбеддинга"""
+        try:
+            # Минимальная предобработка для скорости
+            face_resized = cv2.resize(face_image, (160, 160))
+            face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
 
-            deepsort_results = []
-            for track in tracks:
-                if not track.is_confirmed():
-                    continue
-
-                track_id = track.track_id
-                bbox = track.to_tlbr()  # [x1, y1, x2, y2]
-
-                # Конвертируем в формат [x, y, w, h]
-                x = int(bbox[0])
-                y = int(bbox[1])
-                w = int(bbox[2] - bbox[0])
-                h = int(bbox[3] - bbox[1])
-
-                # Извлекаем признаки внешности
-                appearance_features = track.features if hasattr(track, 'features') else None
-
-                deepsort_results.append({
-                    'track_id': track_id,
-                    'coords': (x, y, w, h),
-                    'appearance_features': appearance_features,
-                    'type': 'deepsort'
-                })
-
-                # Обновляем кэш треков DeepSORT
-                self.deepsort_tracks[track_id] = {
-                    'coords': (x, y, w, h),
-                    'appearance_features': appearance_features,
-                    'last_seen': time.time()
-                }
-
-            return deepsort_results
-
-        except Exception as e:
-            logger.error(f"Ошибка DeepSORT: {e}")
-            return []
-
-    def match_face_with_deepsort(self, face_coords, face_embedding):
-        """Сопоставление лица с треками DeepSORT"""
-        if not self.deepsort_tracks:
-            return None, 0.0
-
-        face_x, face_y, face_w, face_h = face_coords
-        face_center = (face_x + face_w // 2, face_y + face_h // 2)
-
-        best_track_id = None
-        best_similarity = 0.0
-
-        for track_id, track_data in list(self.deepsort_tracks.items()):
-            # Проверяем возраст трека
-            if time.time() - track_data['last_seen'] > self.track_max_age:
-                del self.deepsort_tracks[track_id]
-                continue
-
-            track_x, track_y, track_w, track_h = track_data['coords']
-            track_center = (track_x + track_w // 2, track_y + track_h // 2)
-
-            # Расчет расстояния между центрами
-            distance = np.sqrt((face_center[0] - track_center[0]) ** 2 +
-                               (face_center[1] - track_center[1]) ** 2)
-
-            # Нормализованное расстояние (чем меньше, тем лучше)
-            max_distance = max(face_w, face_h, track_w, track_h)
-            if max_distance > 0:
-                normalized_distance = 1.0 - min(1.0, distance / max_distance)
-            else:
-                normalized_distance = 0.0
-
-            # Если центры достаточно близко, считаем это совпадением
-            if normalized_distance > 0.7:  # Порог близости
-                if normalized_distance > best_similarity:
-                    best_similarity = normalized_distance
-                    best_track_id = track_id
-
-        return best_track_id, best_similarity
-
-    def combined_similarity_score(self, face_similarity, appearance_similarity, spatial_similarity):
-        """Комбинированная оценка схожести"""
-        # Весовые коэффициенты
-        face_weight = 0.6  # Лицо - самый важный признак
-        appearance_weight = 0.3  # Внешность (одежда)
-        spatial_weight = 0.1  # Пространственное положение
-
-        total_score = (face_similarity * face_weight +
-                       appearance_similarity * appearance_weight +
-                       spatial_similarity * spatial_weight)
-
-        return total_score
-
-    def find_best_combined_match(self, embedding, appearance_features, coords):
-        """Поиск лучшего совпадения с комбинированными признаками"""
-        if embedding is None:
-            return None, 0.0
-
-        best_match_id = None
-        best_combined_similarity = 0.0
-
-        for visitor_id, visitor_data in self.known_visitors_cache.items():
-            # Схожесть лиц
-            face_similarity = self.calculate_similarity(embedding, visitor_data['embedding'])
-
-            # Схожесть внешности
-            appearance_similarity = 0.0
-            if appearance_features is not None and visitor_data['appearance_features'] is not None:
-                appearance_similarity = self.calculate_appearance_similarity(
-                    appearance_features, visitor_data['appearance_features']
-                )
-
-            # Пространственная схожесть (в данном контексте не применяется)
-            spatial_similarity = 0.5  # Нейтральное значение
-
-            # Комбинированная оценка
-            combined_similarity = self.combined_similarity_score(
-                face_similarity, appearance_similarity, spatial_similarity
+            result = DeepFace.represent(
+                face_rgb,
+                model_name='Facenet',
+                enforce_detection=False,
+                detector_backend='opencv',
+                align=False
             )
 
-            if combined_similarity > best_combined_similarity:
-                best_combined_similarity = combined_similarity
-                best_match_id = visitor_id
+            embedding = np.array(result[0]['embedding'], dtype=np.float32)
 
-        # Логируем тип совпадения
-        if best_match_id:
-            if best_combined_similarity > self.similarity_threshold:
-                face_only_similarity = self.calculate_similarity(embedding,
-                                                                 self.known_visitors_cache[best_match_id]['embedding'])
-                if face_only_similarity < self.similarity_threshold:
-                    self.recognition_stats['deepsort_matches'] += 1
-                    logger.info(f"🎯 DeepSORT помог опознать пользователя {best_match_id}")
-                else:
-                    self.recognition_stats['face_only_matches'] += 1
+            if np.all(embedding == 0) or np.linalg.norm(embedding) < 0.1:
+                return None
 
-        return best_match_id, best_combined_similarity
+            return embedding
+
+        except Exception as e:
+            logger.warning(f"Ошибка получения эмбеддинга: {e}")
+            return None
 
     def calculate_similarity(self, embedding1, embedding2):
         """Расчет схожести лиц"""
@@ -390,38 +222,169 @@ class AdvancedTrassirCounter:
             logger.debug(f"Ошибка расчета схожести: {e}")
             return 0.0
 
-    # ... (остальные методы save_visitor_photo, update_visitor_gallery, create_gallery_display и т.д.)
-    # остаются аналогичными предыдущей версии, но с добавлением работы с appearance_features
+    def find_best_match(self, embedding):
+        """Поиск лучшего совпадения"""
+        if embedding is None:
+            return None, 0.0
 
-    def _create_new_visitor(self, embedding, face_image, appearance_features, track_id):
-        """Создание нового посетителя с признаками внешности"""
+        best_match_id = None
+        best_similarity = 0.0
+
+        for visitor_id, known_embedding in self.known_visitors_cache.items():
+            similarity = self.calculate_similarity(embedding, known_embedding)
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_match_id = visitor_id
+
+        return best_match_id, best_similarity
+
+    def update_face_tracking(self, current_faces, timestamp):
+        """Обновление трекинга лиц между кадрами"""
+        updated_faces = []
+
+        for face_data in current_faces:
+            embedding = face_data['embedding']
+            coords = face_data['coords']
+            face_image = face_data['face_image']
+
+            best_track_id = None
+            best_similarity = 0.0
+
+            # Удаляем старые треки
+            for track_id in list(self.face_tracks.keys()):
+                if timestamp - self.face_tracks[track_id]['last_seen'] > self.track_max_age:
+                    logger.debug(f"🗑️ Удален старый трек {track_id}")
+                    del self.face_tracks[track_id]
+
+            # Ищем совпадение с существующими треками
+            for track_id, track_data in self.face_tracks.items():
+                similarity = self.calculate_similarity(embedding, track_data['embedding'])
+                if similarity > best_similarity and similarity > self.tracking_threshold:
+                    best_similarity = similarity
+                    best_track_id = track_id
+
+            if best_track_id is not None:
+                # Обновляем существующий трек
+                self.face_tracks[best_track_id].update({
+                    'embedding': embedding,
+                    'last_seen': timestamp,
+                    'coords': coords,
+                    'face_image': face_image
+                })
+                face_data['track_id'] = best_track_id
+                face_data['visitor_id'] = self.face_tracks[best_track_id].get('visitor_id')
+                face_data['status'] = 'tracking'
+                logger.debug(f"🔄 Обновлен трек {best_track_id}, схожесть: {best_similarity:.3f}")
+            else:
+                # Создаем новый трек
+                track_id = self.next_track_id
+                self.next_track_id += 1
+                self.face_tracks[track_id] = {
+                    'embedding': embedding,
+                    'last_seen': timestamp,
+                    'coords': coords,
+                    'face_image': face_image,
+                    'visitor_id': None,
+                    'created_at': timestamp
+                }
+                face_data['track_id'] = track_id
+                face_data['status'] = 'tracking'
+                logger.info(f"🎯 Создан новый трек {track_id}")
+
+            updated_faces.append(face_data)
+
+        return updated_faces
+
+    def confirm_visitor_identity(self, track_id, face_data):
+        """Подтверждение идентичности посетителя"""
+        track_data = self.face_tracks.get(track_id)
+        if not track_data:
+            return None
+
+        embedding = face_data['embedding']
+        face_image = face_data['face_image']
+        timestamp = time.time()
+
+        # Если уже есть visitor_id, обновляем его
+        if track_data['visitor_id']:
+            visitor_id = track_data['visitor_id']
+            self.recognition_stats['known_visitors'] += 1
+            face_data['status'] = 'known'
+
+            # Обновляем галерею
+            self.update_visitor_gallery(visitor_id, face_image, 'known')
+
+            logger.debug(f"♻️  Подтвержден известный посетитель {visitor_id}")
+            return visitor_id
+
+        # Ищем лучшего кандидата среди известных
+        visitor_id, similarity = self.find_best_match(embedding)
+
+        if similarity > self.similarity_threshold:
+            # Подтверждаем существующего посетителя
+            track_data['visitor_id'] = visitor_id
+            track_data['confirmed_at'] = timestamp
+            self.recognition_stats['known_visitors'] += 1
+            face_data['status'] = 'known'
+
+            # Обновляем галерею
+            self.update_visitor_gallery(visitor_id, face_image, 'known')
+
+            logger.info(f"👤 ОПОЗНАН известный посетитель {visitor_id}, схожесть: {similarity:.3f}")
+            return visitor_id
+        else:
+            # Ждем подтверждения для нового посетителя
+            track_duration = timestamp - track_data['created_at']
+            if track_duration > 2.0:  # Минимум 2 секунды трекинга
+                new_visitor_id = self._create_new_visitor(embedding, face_image, track_id)
+                if new_visitor_id:
+                    self.recognition_stats['new_visitors'] += 1
+                    face_data['status'] = 'new'
+
+                    # Сохраняем фото и обновляем галерею
+                    self.update_visitor_gallery(new_visitor_id, face_image, 'new')
+
+                    logger.info(f"🆕 СОЗДАН новый посетитель {new_visitor_id}, схожесть с известными: {similarity:.3f}")
+                return new_visitor_id
+            else:
+                face_data['status'] = 'analyzing'
+                logger.debug(f"⏳ Трек {track_id} ожидает подтверждения ({track_duration:.1f}s)")
+
+        return None
+
+    def _create_new_visitor(self, embedding, face_image, track_id):
+        """Создание нового посетителя"""
         cursor = self.conn.cursor()
         now = datetime.datetime.now()
 
         visitor_id = None
         try:
-            # Сохраняем фото
-            photo_path = self.save_visitor_photo(face_image, visitor_id)
+            # Сначала сохраняем фото чтобы получить путь
+            photo_path = self.save_visitor_photo(face_image, "temp")
 
-            # Подготавливаем бинарные данные
+            # Создаем запись в базе
             embedding_blob = embedding.astype(np.float32).tobytes()
-            appearance_blob = appearance_features.astype(
-                np.float32).tobytes() if appearance_features is not None else None
-
             cursor.execute(
                 """INSERT INTO visitors (face_embedding, first_seen, last_seen, 
-                   visit_count, last_updated, confirmed_count, photo_path, appearance_features) 
-                   VALUES (?, ?, ?, 1, ?, 1, ?, ?)""",
-                (embedding_blob, now, now, now, photo_path, appearance_blob)
+                   visit_count, last_updated, confirmed_count, photo_path) 
+                   VALUES (?, ?, ?, 1, ?, 1, ?)""",
+                (embedding_blob, now, now, now, photo_path)
             )
             visitor_id = cursor.lastrowid
 
-            self.known_visitors_cache[visitor_id] = {
-                'embedding': embedding,
-                'photo_path': photo_path,
-                'appearance_features': appearance_features
-            }
+            # Обновляем путь к фото с правильным ID
+            final_photo_path = self.save_visitor_photo(face_image, visitor_id)
+            cursor.execute(
+                "UPDATE visitors SET photo_path = ? WHERE id = ?",
+                (final_photo_path, visitor_id)
+            )
+
+            self.known_visitors_cache[visitor_id] = embedding
             self.conn.commit()
+
+            # Удаляем временное фото
+            if os.path.exists(photo_path):
+                os.remove(photo_path)
 
         except Exception as e:
             logger.error(f"❌ Ошибка создания посетителя: {e}")
@@ -433,21 +396,316 @@ class AdvancedTrassirCounter:
 
         return visitor_id
 
-    def start_analysis(self, rtsp_url):
-        """Запуск анализа с DeepSORT"""
-        logger.info("🚀 Запуск продвинутой версии с DeepSORT...")
+    def save_visitor_photo(self, face_image, visitor_id):
+        """Сохранение фото посетителя"""
+        try:
+            photo_clean = face_image.copy()
 
-        if not DEEPSORT_AVAILABLE:
-            logger.warning("⚠️  DeepSORT недоступен. Установите: pip install deep-sort-realtime")
+            height, width = photo_clean.shape[:2]
+            if width < 200:
+                scale = 200 / width
+                new_width = 200
+                new_height = int(height * scale)
+                photo_clean = cv2.resize(photo_clean, (new_width, new_height), interpolation=cv2.INTER_LANCZOS4)
+
+            filename = f"visitor_{visitor_id}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            filepath = os.path.join(self.photos_dir, filename)
+            session_filepath = os.path.join(self.photos_dir, self.current_session_dir, filename)
+
+            cv2.imwrite(filepath, photo_clean)
+            cv2.imwrite(session_filepath, photo_clean)
+
+            logger.info(f"📸 Сохранено фото посетителя {visitor_id}")
+            return filepath
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения фото: {e}")
+            return ""
+
+    def update_visitor_gallery(self, visitor_id, face_image, status):
+        """Обновление галереи текущих посетителей"""
+        try:
+            gallery_photo = face_image.copy()
+
+            border_color = self.COLORS.get(status, (255, 255, 255))
+            gallery_photo = cv2.copyMakeBorder(
+                gallery_photo, 5, 25, 5, 5, cv2.BORDER_CONSTANT, value=border_color
+            )
+
+            status_text = self.get_status_text(status)
+            cv2.putText(gallery_photo, f"ID: {visitor_id}", (10, gallery_photo.shape[0] - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, border_color, 1)
+
+            gallery_photo = cv2.resize(gallery_photo, self.photo_size, interpolation=cv2.INTER_AREA)
+
+            self.current_visitors_gallery[visitor_id] = {
+                'photo': gallery_photo,
+                'last_seen': time.time(),
+                'status': status
+            }
+
+            if len(self.current_visitors_gallery) > self.gallery_max_size:
+                oldest_visitor = min(self.current_visitors_gallery.keys(),
+                                     key=lambda x: self.current_visitors_gallery[x]['last_seen'])
+                del self.current_visitors_gallery[oldest_visitor]
+
+        except Exception as e:
+            logger.error(f"Ошибка обновления галереи: {e}")
+
+    def get_status_text(self, status):
+        """Получение текста по статусу"""
+        status_texts = {
+            'detected': 'DETECTED',
+            'tracking': 'TRACKING',
+            'analyzing': 'ANALYZING',
+            'known': 'KNOWN',
+            'new': 'NEW USER'
+        }
+        return status_texts.get(status, 'UNKNOWN')
+
+    def get_color_by_status(self, status):
+        """Получение цвета по статусу"""
+        return self.COLORS.get(status, (255, 255, 255))
+
+    def create_gallery_display(self, main_frame):
+        """Создание галереи посетителей"""
+        try:
+            main_height, main_width = main_frame.shape[:2]
+
+            gallery_width = 300
+            gallery_panel = np.zeros((main_height, gallery_width, 3), dtype=np.uint8)
+
+            cv2.putText(gallery_panel, "CURRENT VISITORS", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(gallery_panel, f"Total: {len(self.current_visitors_gallery)}", (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+            if self.current_visitors_gallery:
+                visitor_ids = sorted(self.current_visitors_gallery.keys())
+                photos_per_column = 4
+                photo_width, photo_height = self.photo_size
+                margin = 10
+
+                for i, visitor_id in enumerate(visitor_ids):
+                    if i >= self.gallery_max_size:
+                        break
+
+                    visitor_data = self.current_visitors_gallery[visitor_id]
+                    row = i % photos_per_column
+                    col = i // photos_per_column
+
+                    x = margin + col * (photo_width + margin)
+                    y = 80 + row * (photo_height + margin)
+
+                    if y + photo_height < main_height and x + photo_width < gallery_width:
+                        gallery_panel[y:y + photo_height, x:x + photo_width] = visitor_data['photo']
+
+                        status_color = self.COLORS.get(visitor_data['status'], (255, 255, 255))
+                        cv2.circle(gallery_panel, (x + 10, y + 10), 5, status_color, -1)
+            else:
+                cv2.putText(gallery_panel, "No visitors", (50, main_height // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 1)
+                cv2.putText(gallery_panel, "in frame", (60, main_height // 2 + 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 1)
+
+            combined_frame = np.hstack([main_frame, gallery_panel])
+            return combined_frame
+
+        except Exception as e:
+            logger.error(f"Ошибка создания галереи: {e}")
+            return main_frame
+
+    def resize_frame_for_display(self, frame, target_width=1280):
+        """Изменение размера кадра для отображения"""
+        height, width = frame.shape[:2]
+
+        if width <= target_width:
+            return frame
+
+        ratio = target_width / width
+        new_width = target_width
+        new_height = int(height * ratio)
+
+        resized_frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+
+        return resized_frame
+
+    def log_recognition_stats(self):
+        """Логирование статистики распознавания"""
+        current_time = time.time()
+        if current_time - self.last_log_time >= 3.0:  # Каждые 3 секунды
+            logger.info(f"📊 СТАТИСТИКА: Всего в базе: {len(self.known_visitors_cache)}, "
+                        f"Активных треков: {len(self.face_tracks)}, "
+                        f"В галерее: {len(self.current_visitors_gallery)}, "
+                        f"Новых за сессию: {self.recognition_stats['new_visitors']}, "
+                        f"Известных: {self.recognition_stats['known_visitors']}")
+            self.last_log_time = current_time
+
+    def start_processing_thread(self):
+        """Запуск фонового потока обработки"""
+        self.stop_processing = False
+        self.processing_thread = threading.Thread(target=self._processing_worker, daemon=True)
+        self.processing_thread.start()
+        logger.info("Фоновый поток обработки запущен")
+
+    def _processing_worker(self):
+        """Фоновая обработка кадров"""
+        while not self.stop_processing:
+            try:
+                frame_data = self.frame_queue.get(timeout=1.0)
+                frame, frame_time = frame_data
+
+                result = self._process_frame_heavy(frame)
+                self.results_queue.put((result, frame_time))
+
+                self.frame_queue.task_done()
+
+            except:
+                continue
+
+    def _process_frame_heavy(self, frame):
+        """Тяжелые операции обработки"""
+        try:
+            # Детекция лиц
+            faces = self.detect_faces_robust(frame)
+
+            processed_faces = []
+            if len(faces) > 0:
+                self.recognition_stats['total_detections'] += len(faces)
+                logger.info(f"👥 ОБНАРУЖЕНО ЛИЦ: {len(faces)}")
+
+                for (x, y, w, h) in faces:
+                    if 50 <= w <= 400 and 50 <= h <= 400:
+                        face_img = frame[y:y + h, x:x + w]
+
+                        embedding = self.get_fast_embedding(face_img)
+                        if embedding is not None:
+                            visitor_id, similarity = self.find_best_match(embedding)
+
+                            processed_faces.append({
+                                'coords': (x, y, w, h),
+                                'embedding': embedding,
+                                'similarity': similarity,
+                                'visitor_id': visitor_id,
+                                'status': 'detected',
+                                'face_image': face_img
+                            })
+                        else:
+                            logger.warning("❌ Не удалось получить эмбеддинг для лица")
+
+            return {
+                'faces': processed_faces,
+                'processed_count': len(processed_faces),
+                'detected_count': len(faces),
+                'timestamp': time.time()
+            }
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка в фоновой обработке: {e}")
+            return {'faces': [], 'processed_count': 0, 'detected_count': 0}
+
+    def setup_rtsp_camera(self, rtsp_url):
+        """Настройка RTSP"""
+        logger.info(f"📡 Подключение к камере: {rtsp_url}")
+        cap = cv2.VideoCapture(rtsp_url)
+
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FPS, 15)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'H264'))
+
+        # Пропускаем кадры для стабилизации
+        for _ in range(10):
+            cap.read()
+
+        if cap.isOpened():
+            ret, test_frame = cap.read()
+            if ret:
+                logger.info(f"✅ Камера подключена. Разрешение: {test_frame.shape[1]}x{test_frame.shape[0]}")
+            else:
+                logger.error("❌ Камера не передает данные")
+        else:
+            logger.error("❌ Не удалось подключиться к камере")
+
+        return cap
+
+    def process_frame_realtime(self, frame):
+        """Обработка кадра в реальном времени"""
+        current_time = time.time()
+
+        # Обновляем FPS
+        self.fps_frame_count += 1
+        if current_time - self.fps_start_time >= 1.0:
+            self.current_fps = self.fps_frame_count / (current_time - self.fps_start_time)
+            self.fps_frame_count = 0
+            self.fps_start_time = current_time
+
+        # Обрабатываем с интервалом
+        if current_time - self.last_processing_time < self.processing_interval:
+            try:
+                result, frame_time = self.results_queue.get_nowait()
+                return self._apply_processing_result(frame, result, current_time)
+            except:
+                return frame, 0, 0
+
+        # Отправляем в фоновую обработку
+        if self.frame_queue.empty():
+            self.frame_queue.put((frame.copy(), current_time))
+
+        self.last_processing_time = current_time
+
+        # Пробуем получить результаты
+        try:
+            result, frame_time = self.results_queue.get_nowait()
+            return self._apply_processing_result(frame, result, current_time)
+        except:
+            return frame, 0, 0
+
+    def _apply_processing_result(self, frame, result, current_time):
+        """Применяет результаты обработки"""
+        processed_frame = frame.copy()
+        processed_count = 0
+
+        # Обновляем трекинг
+        tracked_faces = self.update_face_tracking(result['faces'], current_time)
+
+        for face_data in tracked_faces:
+            visitor_id = self.confirm_visitor_identity(face_data['track_id'], face_data)
+
+            x, y, w, h = face_data['coords']
+            status = face_data.get('status', 'detected')
+
+            color = self.get_color_by_status(status)
+            status_text = self.get_status_text(status)
+
+            # Отрисовка рамки
+            cv2.rectangle(processed_frame, (x, y), (x + w, y + h), color, 3)
+            cv2.putText(processed_frame, f'{status_text}', (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+            if visitor_id:
+                cv2.putText(processed_frame, f'ID: {visitor_id}', (x, y + h + 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                cv2.putText(processed_frame, f'Sim: {face_data["similarity"]:.2f}',
+                            (x, y + h + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+            processed_count += 1
+
+        self.log_recognition_stats()
+
+        return processed_frame, result['detected_count'], processed_count
+
+    def start_analysis(self, rtsp_url):
+        """Запуск анализа"""
+        logger.info("🚀 Запуск упрощенной версии...")
 
         cap = self.setup_rtsp_camera(rtsp_url)
         if not cap.isOpened():
             return
 
         self.start_processing_thread()
-        logger.info("✅ Продвинутый анализ запущен")
+        logger.info("✅ Анализ запущен")
 
-        window_name = 'Trassir Analytics - DEEPSORT'
+        window_name = 'Trassir Analytics - SIMPLE & RELIABLE'
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_name, 1600, 900)
 
@@ -455,7 +713,7 @@ class AdvancedTrassirCounter:
             while True:
                 ret, frame = cap.read()
                 if not ret:
-                    logger.warning("📡 Потеряно соединение...")
+                    logger.warning("📡 Потеряно соединение с камерой...")
                     time.sleep(2)
                     continue
 
@@ -463,20 +721,19 @@ class AdvancedTrassirCounter:
                 display_frame = self.resize_frame_for_display(processed_frame, target_width=1280)
                 display_with_gallery = self.create_gallery_display(display_frame)
 
-                # Статистика с информацией о DeepSORT
+                # Статистика на экране
                 stats_text = [
-                    f"ADVANCED ANALYTICS WITH DEEPSORT",
-                    f"Detected: {detected}",
-                    f"Processed: {processed}",
-                    f"DeepSORT: {'ON' if DEEPSORT_AVAILABLE else 'OFF'}",
-                    f"DeepSORT matches: {self.recognition_stats['deepsort_matches']}",
-                    f"Face matches: {self.recognition_stats['face_only_matches']}",
+                    f"SIMPLE & RELIABLE ANALYTICS",
+                    f"Faces detected: {detected}",
+                    f"Visitors processed: {processed}",
+                    f"Active tracks: {len(self.face_tracks)}",
+                    f"In gallery: {len(self.current_visitors_gallery)}",
                     f"FPS: {self.current_fps:.1f}",
                     f"Press 'q' to quit"
                 ]
 
                 overlay = display_with_gallery.copy()
-                cv2.rectangle(overlay, (0, 0), (550, 200), (0, 0, 0), -1)
+                cv2.rectangle(overlay, (0, 0), (500, 200), (0, 0, 0), -1)
                 cv2.addWeighted(overlay, 0.7, display_with_gallery, 0.3, 0, display_with_gallery)
 
                 for i, text in enumerate(stats_text):
@@ -489,7 +746,7 @@ class AdvancedTrassirCounter:
                     break
 
         except KeyboardInterrupt:
-            logger.info("⏹️ Остановка...")
+            logger.info("⏹️ Остановка по Ctrl+C...")
         finally:
             self.stop_processing = True
             if self.processing_thread:
@@ -500,8 +757,8 @@ class AdvancedTrassirCounter:
 
             logger.info(f"📊 ФИНАЛЬНАЯ СТАТИСТИКА:")
             logger.info(f"   Всего посетителей: {len(self.known_visitors_cache)}")
-            logger.info(f"   Совпадений по DeepSORT: {self.recognition_stats['deepsort_matches']}")
-            logger.info(f"   Совпадений только по лицу: {self.recognition_stats['face_only_matches']}")
+            logger.info(f"   Новых создано: {self.recognition_stats['new_visitors']}")
+            logger.info(f"   Известных обработано: {self.recognition_stats['known_visitors']}")
             logger.info("✅ Анализ завершен")
 
 
@@ -509,8 +766,8 @@ def main():
     """Основная функция"""
     RTSP_URL = "rtsp://admin:admin@10.0.0.242:554/live/main"
 
-    counter = AdvancedTrassirCounter(
-        processing_interval=1.0,  # Уменьшили интервал для лучшего трекинга
+    counter = SimpleTrassirCounter(
+        processing_interval=1.0,
         similarity_threshold=0.55,
         tracking_threshold=0.45
     )
