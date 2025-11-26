@@ -1,4 +1,4 @@
-# video_analytics_trassir_final.py
+# video_analytics_trassir_5fps.py
 import cv2
 import numpy as np
 import sqlite3
@@ -26,17 +26,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class FastTrassirCounter:
-    def __init__(self, processing_interval=1.5, similarity_threshold=0.65, tracking_threshold=0.50):
+class Fast5FPScounter:
+    def __init__(self, processing_interval=1.5, similarity_threshold=0.65):
         """
-        БЫСТРАЯ версия с большим окном и минимальными задержками
+        Версия с фиксированным опросом 5 раз в секунду (200ms)
         """
-        self.conn = sqlite3.connect('visitors_trassir_fast.db', check_same_thread=False)
+        self.conn = sqlite3.connect('visitors_trassir_5fps.db', check_same_thread=False)
         self._init_database()
 
         self.processing_interval = processing_interval
         self.similarity_threshold = similarity_threshold
-        self.tracking_threshold = tracking_threshold
+
+        # ФИКСИРОВАННЫЕ НАСТРОЙКИ ОПРОСА
+        self.target_fps = 5  # 5 кадров в секунду
+        self.frame_interval = 0.2  # 200ms между кадрами
 
         # Мьютексы для потокобезопасности
         self.stats_lock = Lock()
@@ -53,7 +56,7 @@ class FastTrassirCounter:
         }
 
         # Папки для хранения фото
-        self.photos_dir = "visitor_photos_fast"
+        self.photos_dir = "visitor_photos_5fps"
         self.current_session_dir = "current_session"
         self._create_directories()
 
@@ -65,7 +68,7 @@ class FastTrassirCounter:
         # Система трекинга лиц
         self.face_tracks = {}
         self.next_track_id = 1
-        self.track_max_age = 5.0  # Уменьшили время жизни трека
+        self.track_max_age = 3.0  # Уменьшили для быстрого обновления
 
         # Статистика
         self.recognition_stats = {
@@ -76,7 +79,8 @@ class FastTrassirCounter:
             'known_visitors': 0,
             'frames_processed': 0,
             'faces_processed': 0,
-            'quality_rejections': defaultdict(int)
+            'quality_rejections': defaultdict(int),
+            'actual_fps': 0.0
         }
 
         # Детектор лиц
@@ -89,15 +93,17 @@ class FastTrassirCounter:
         self.fps_frame_count = 0
         self.current_fps = 0
 
+        # Таймер для контроля интервала
+        self.last_frame_time = 0
+
         # Оптимизации
-        self.last_face_processing_time = 0
         self.embedding_cache = {}
         self.cache_max_size = 100
 
         # Предзагрузка известных посетителей
         self._load_known_visitors()
 
-        logger.info("🚀 БЫСТРАЯ система инициализирована")
+        logger.info(f"🚀 Система инициализирована с опросом {self.target_fps} FPS")
 
     def _create_directories(self):
         """Создание папок для хранения фото"""
@@ -141,17 +147,16 @@ class FastTrassirCounter:
         logger.info(f"📊 Загружено посетителей: {len(self.known_visitors_cache)}")
 
     def setup_rtsp_camera(self, rtsp_url):
-        """Настройка RTSP подключения с минимальными задержками"""
+        """Настройка RTSP подключения с минимальным буфером"""
         logger.info(f"📡 Подключение к камере: {rtsp_url}")
 
-        # Параметры для минимальной задержки
+        # Минимальный буфер для уменьшения задержки
         cap = cv2.VideoCapture(rtsp_url)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        cap.set(cv2.CAP_PROP_FPS, 25)
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'H264'))
+        cap.set(cv2.CAP_PROP_FPS, 10)  # Не влияет на RTSP, но для совместимости
 
-        # Пропускаем первые кадры для очистки буфера
-        for _ in range(3):
+        # Очистка буфера камеры
+        for _ in range(5):
             cap.read()
 
         if cap.isOpened():
@@ -165,8 +170,8 @@ class FastTrassirCounter:
 
         return cap
 
-    def resize_frame_fast(self, frame, max_width=1920):
-        """Быстрое изменение размера с сохранением качества"""
+    def resize_frame_fast(self, frame, max_width=1280):
+        """Быстрое изменение размера"""
         h, w = frame.shape[:2]
         if w <= max_width:
             return frame
@@ -178,18 +183,17 @@ class FastTrassirCounter:
         return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
     def detect_faces_fast(self, frame):
-        """Сверхбыстрая детекция лиц"""
+        """Быстрая детекция лиц"""
         try:
-            # Уменьшаем размер для быстрой обработки, но не слишком сильно
-            small_frame = self.resize_frame_fast(frame, 960)  # 960px вместо 640
+            # Умеренное уменьшение для скорости
+            small_frame = self.resize_frame_fast(frame, 800)
             gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
 
-            # Оптимальные параметры для скорости и качества
             faces = self.face_cascade.detectMultiScale(
                 gray,
                 scaleFactor=1.1,
-                minNeighbors=3,  # Уменьшили для большей чувствительности
-                minSize=(60, 60),  # Увеличили минимальный размер
+                minNeighbors=3,
+                minSize=(60, 60),
                 maxSize=(400, 400),
                 flags=cv2.CASCADE_SCALE_IMAGE
             )
@@ -207,10 +211,9 @@ class FastTrassirCounter:
                     int(h * scale_y)
                 )
 
-                # Базовая проверка размера
                 if w * scale_x >= 60 and h * scale_y >= 60:
                     valid_faces.append(scaled_bbox)
-                    logger.info(f"✅ Обнаружено лицо: {int(w * scale_x)}x{int(h * scale_y)} пикс")
+                    logger.debug(f"✅ Лицо: {int(w * scale_x)}x{int(h * scale_y)}")
 
             return valid_faces
 
@@ -219,14 +222,12 @@ class FastTrassirCounter:
             return []
 
     def get_embedding_fast(self, face_image):
-        """Быстрое получение эмбеддинга с кэшированием"""
+        """Быстрое получение эмбеддинга"""
         try:
-            # Кэширование по хэшу
             img_hash = hash(face_image.tobytes())
             if img_hash in self.embedding_cache:
                 return self.embedding_cache[img_hash]
 
-            # Быстрая обработка
             face_resized = cv2.resize(face_image, (160, 160))
             face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
 
@@ -300,7 +301,7 @@ class FastTrassirCounter:
                 best_distance = float('inf')
 
                 for track_id, track_info in self.face_tracks.items():
-                    if current_time - track_info['last_seen'] > 2.0:
+                    if current_time - track_info['last_seen'] > 1.0:
                         continue
 
                     last_center = track_info['last_center']
@@ -341,7 +342,7 @@ class FastTrassirCounter:
         return active_tracks
 
     def process_face_recognition(self, track_info, face_roi, track_id):
-        """Обработка распознавания лица с логированием"""
+        """Обработка распознавания лица"""
         try:
             embedding = self.get_embedding_fast(face_roi)
             if embedding is None:
@@ -367,21 +368,35 @@ class FastTrassirCounter:
                     self.recognition_stats['known_visitors'] += 1
                     self.recognition_stats['faces_processed'] += 1
 
-                logger.info(f"👤 Распознан известный посетитель ID:{visitor_id} (сходство: {similarity:.3f})")
+                logger.info(f"👤 Распознан ID:{visitor_id} (сходство: {similarity:.3f})")
                 return True
             else:
                 # Новый посетитель
-                visitor_id = self.add_new_visitor(embedding, face_roi)
-                if visitor_id:
-                    track_info['visitor_id'] = visitor_id
-                    track_info['status'] = 'new'
+                cursor = self.conn.cursor()
+                filename = f"visitor_{int(time.time())}.jpg"
+                filepath = os.path.join(self.photos_dir, self.current_session_dir, filename)
+                cv2.imwrite(filepath, face_roi)
 
-                    with self.stats_lock:
-                        self.recognition_stats['new_visitors'] += 1
-                        self.recognition_stats['faces_processed'] += 1
+                cursor.execute('''
+                    INSERT INTO visitors 
+                    (face_embedding, first_seen, last_seen, last_updated, photo_path)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (embedding.tobytes(), datetime.datetime.now(), datetime.datetime.now(),
+                      datetime.datetime.now(), filepath))
 
-                    logger.info(f"🆕 Добавлен новый посетитель ID:{visitor_id}")
-                    return True
+                new_visitor_id = cursor.lastrowid
+                self.conn.commit()
+
+                self.known_visitors_cache[new_visitor_id] = embedding
+                track_info['visitor_id'] = new_visitor_id
+                track_info['status'] = 'new'
+
+                with self.stats_lock:
+                    self.recognition_stats['new_visitors'] += 1
+                    self.recognition_stats['faces_processed'] += 1
+
+                logger.info(f"🆕 Новый посетитель ID:{new_visitor_id}")
+                return True
 
             return False
 
@@ -389,43 +404,16 @@ class FastTrassirCounter:
             logger.error(f"❌ Ошибка распознавания: {e}")
             return False
 
-    def add_new_visitor(self, embedding, face_image):
-        """Добавление нового посетителя"""
-        try:
-            cursor = self.conn.cursor()
-
-            # Сохранение фото
-            filename = f"visitor_{int(time.time())}.jpg"
-            filepath = os.path.join(self.photos_dir, self.current_session_dir, filename)
-            cv2.imwrite(filepath, face_image)
-
-            cursor.execute('''
-                INSERT INTO visitors 
-                (face_embedding, first_seen, last_seen, last_updated, photo_path)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (embedding.tobytes(), datetime.datetime.now(), datetime.datetime.now(),
-                  datetime.datetime.now(), filepath))
-
-            new_visitor_id = cursor.lastrowid
-            self.conn.commit()
-
-            # Обновление кэша
-            self.known_visitors_cache[new_visitor_id] = embedding
-
-            return new_visitor_id
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка добавления посетителя: {e}")
-            return None
-
-    def process_frame_realtime(self, frame):
-        """Обработка кадра в реальном времени без задержек"""
+    def process_frame_5fps(self, frame):
+        """Обработка кадра с контролем времени"""
         current_time = time.time()
 
-        # Обновление FPS каждую секунду
+        # Обновление FPS
         self.fps_frame_count += 1
         if current_time - self.fps_start_time >= 1.0:
-            self.current_fps = self.fps_frame_count / (current_time - self.fps_start_time)
+            actual_fps = self.fps_frame_count / (current_time - self.fps_start_time)
+            self.current_fps = actual_fps
+            self.recognition_stats['actual_fps'] = actual_fps
             self.fps_start_time = current_time
             self.fps_frame_count = 0
 
@@ -462,14 +450,14 @@ class FastTrassirCounter:
                 conf_count = track_info.get('confirmed_count', 1)
                 label = f"TRACK {track_id} ({conf_count})"
 
-            # Отрисовка текста с фоном для читаемости
+            # Отрисовка текста с фоном
             text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
             cv2.rectangle(processed_frame, (x, y - text_size[1] - 10),
                           (x + text_size[0], y), color, -1)
             cv2.putText(processed_frame, label, (x, y - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-            # Обработка распознавания для стабильных треков
+            # Обработка распознавания
             if (track_info['confirmed_count'] >= 2 and
                     current_time - track_info.get('last_processed', 0) > self.processing_interval and
                     track_info.get('status') in [None, 'detected']):
@@ -488,25 +476,37 @@ class FastTrassirCounter:
 
         return processed_frame, detected_count, processed_count
 
-    def start_analysis(self, rtsp_url):
-        """Запуск анализа с большим окном и минимальными задержками"""
-        logger.info("🚀 Запуск БЫСТРОЙ версии...")
+    def start_analysis_5fps(self, rtsp_url):
+        """Запуск анализа с фиксированным опросом 5 FPS"""
+        logger.info("🚀 Запуск с опросом 5 FPS (200ms интервал)")
 
         cap = self.setup_rtsp_camera(rtsp_url)
         if not cap.isOpened():
             return
 
-        # Создаем большое окно
-        window_name = 'Trassir Analytics - FAST MODE'
+        # Большое окно
+        window_name = 'Trassir Analytics - 5 FPS MODE'
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window_name, 1600, 1200)  # Большое окно
+        cv2.resizeWindow(window_name, 1600, 1200)
 
-        logger.info("✅ Анализ запущен!")
+        logger.info("✅ Анализ запущен с интервалом 200ms!")
 
         try:
-            while True:
-                start_time = time.time()
+            self.last_frame_time = time.time()
 
+            while True:
+                current_time = time.time()
+
+                # КОНТРОЛЬ ИНТЕРВАЛА - ждем пока не пройдет 200ms
+                time_since_last_frame = current_time - self.last_frame_time
+                if time_since_last_frame < self.frame_interval:
+                    time_to_wait = self.frame_interval - time_since_last_frame
+                    time.sleep(time_to_wait)
+                    continue
+
+                self.last_frame_time = current_time
+
+                # Чтение кадра
                 ret, frame = cap.read()
                 if not ret:
                     logger.warning("📡 Потеряно соединение...")
@@ -514,15 +514,18 @@ class FastTrassirCounter:
                     continue
 
                 # Обработка кадра
-                processed_frame, detected, processed = self.process_frame_realtime(frame)
+                start_process_time = time.time()
+                processed_frame, detected, processed = self.process_frame_5fps(frame)
+                process_duration = time.time() - start_process_time
 
                 # Подготовка к отображению
                 display_frame = self.resize_frame_fast(processed_frame, 1600)
 
-                # Статистика на экране (крупный текст)
+                # Статистика на экране
                 stats_text = [
-                    f"FAST MODE - REAL TIME",
-                    f"FPS: {self.current_fps:.1f}",
+                    f"5 FPS MODE - FIXED INTERVAL",
+                    f"Target FPS: {self.target_fps} | Actual: {self.current_fps:.1f}",
+                    f"Process time: {process_duration * 1000:.1f}ms",
                     f"Active Faces: {detected}",
                     f"Total Tracks: {len(self.face_tracks)}",
                     f"Faces Processed: {processed}",
@@ -531,11 +534,11 @@ class FastTrassirCounter:
                     f"Press Q to quit"
                 ]
 
-                # Отрисовка статистики с фоном
+                # Отрисовка статистики
                 for i, text in enumerate(stats_text):
                     y_position = 40 + i * 35
                     cv2.rectangle(display_frame, (10, y_position - 30),
-                                  (600, y_position + 5), (0, 0, 0), -1)
+                                  (650, y_position + 5), (0, 0, 0), -1)
                     cv2.putText(display_frame, text, (15, y_position),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
@@ -555,12 +558,11 @@ class FastTrassirCounter:
 
             # Финальная статистика
             logger.info(f"📊 ФИНАЛЬНАЯ СТАТИСТИКА:")
-            logger.info(f"   Средний FPS: {self.current_fps:.1f}")
+            logger.info(f"   Целевой FPS: {self.target_fps}")
+            logger.info(f"   Фактический FPS: {self.recognition_stats['actual_fps']:.1f}")
             logger.info(f"   Обработано кадров: {self.recognition_stats['frames_processed']}")
             logger.info(f"   Обнаружено лиц: {self.recognition_stats['valid_detections']}")
             logger.info(f"   Обработано лиц: {self.recognition_stats['faces_processed']}")
-            logger.info(f"   Известных: {self.recognition_stats['known_visitors']}")
-            logger.info(f"   Новых: {self.recognition_stats['new_visitors']}")
             logger.info("✅ Анализ завершен")
 
 
@@ -568,14 +570,13 @@ def main():
     """Основная функция"""
     RTSP_URL = "rtsp://admin:admin@10.0.0.242:554/live/main"
 
-    counter = FastTrassirCounter(
+    counter = Fast5FPScounter(
         processing_interval=1.5,
-        similarity_threshold=0.65,
-        tracking_threshold=0.50
+        similarity_threshold=0.65
     )
 
     try:
-        counter.start_analysis(RTSP_URL)
+        counter.start_analysis_5fps(RTSP_URL)
     except Exception as e:
         logger.error(f"❌ Критическая ошибка: {e}")
 
