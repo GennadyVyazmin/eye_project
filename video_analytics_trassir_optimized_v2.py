@@ -1,4 +1,4 @@
-# video_analytics_trassir_optimized_fixed_gui.py
+# video_analytics_trassir_color_coded.py
 import cv2
 import numpy as np
 import sqlite3
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 class OptimizedTrassirCounter:
     def __init__(self, processing_interval=1.5, similarity_threshold=0.55, tracking_threshold=0.45):
         """
-        Версия с фиксированным нормальным размером GUI
+        Версия с цветовой индикацией статусов лиц
         """
         self.conn = sqlite3.connect('visitors_trassir_opt_v2.db', check_same_thread=False)
         self._init_database()
@@ -26,6 +26,15 @@ class OptimizedTrassirCounter:
         self.processing_interval = processing_interval
         self.similarity_threshold = similarity_threshold
         self.tracking_threshold = tracking_threshold
+
+        # Цвета для индикации статусов
+        self.COLORS = {
+            'detected': (0, 255, 0),  # Зеленый - лицо обнаружено
+            'tracking': (255, 255, 0),  # Желтый/Синий - создан трек (используем желтый для лучшей видимости)
+            'known': (0, 255, 0),  # Зеленый - известный пользователь
+            'new': (0, 0, 255),  # Красный - новый пользователь в БД
+            'analyzing': (255, 165, 0)  # Оранжевый - анализ в процессе
+        }
 
         # Трекинг состояния
         self.last_processing_time = 0
@@ -67,7 +76,7 @@ class OptimizedTrassirCounter:
         self.fps_frame_count = 0
         self.current_fps = 0
 
-        logger.info(f"Улучшенная инициализация с нормальным GUI")
+        logger.info(f"Улучшенная инициализация с цветовой индикацией")
 
     def _init_database(self):
         """Инициализация базы данных"""
@@ -106,16 +115,13 @@ class OptimizedTrassirCounter:
         """Умное изменение размера кадра для отображения"""
         height, width = frame.shape[:2]
 
-        # Если изображение уже меньше целевой ширины, не уменьшаем
         if width <= target_width:
             return frame
 
-        # Рассчитываем новые размеры с сохранением пропорций
         ratio = target_width / width
         new_width = target_width
         new_height = int(height * ratio)
 
-        # Ресайз с хорошей интерполяцией
         resized_frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
 
         return resized_frame
@@ -202,7 +208,8 @@ class OptimizedTrassirCounter:
                                 'embedding': embedding,
                                 'similarity': similarity,
                                 'visitor_id': visitor_id,
-                                'is_confirmed': similarity > self.similarity_threshold
+                                'is_confirmed': similarity > self.similarity_threshold,
+                                'status': 'detected'  # Изначальный статус
                             })
 
             return {
@@ -312,6 +319,7 @@ class OptimizedTrassirCounter:
                     best_track_id = track_id
 
             if best_track_id is not None:
+                # Обновляем существующий трек
                 self.face_tracks[best_track_id].update({
                     'embedding': embedding,
                     'last_seen': timestamp,
@@ -319,8 +327,10 @@ class OptimizedTrassirCounter:
                 })
                 face_data['track_id'] = best_track_id
                 face_data['visitor_id'] = self.face_tracks[best_track_id].get('visitor_id')
+                face_data['status'] = 'tracking'  # Обновляем статус на трекинг
                 logger.debug(f"🔄 Обновлен трек {best_track_id}, схожесть: {best_similarity:.3f}")
             else:
+                # Создаем новый трек
                 track_id = self.next_track_id
                 self.next_track_id += 1
                 self.face_tracks[track_id] = {
@@ -328,9 +338,11 @@ class OptimizedTrassirCounter:
                     'last_seen': timestamp,
                     'coords': coords,
                     'visitor_id': None,
-                    'created_at': timestamp
+                    'created_at': timestamp,
+                    'status': 'tracking'
                 }
                 face_data['track_id'] = track_id
+                face_data['status'] = 'tracking'  # Новый трек
                 logger.info(f"🎯 Создан новый трек {track_id}")
 
             updated_faces.append(face_data)
@@ -354,6 +366,7 @@ class OptimizedTrassirCounter:
                 self.known_visitors_cache[visitor_id] = new_embedding / np.linalg.norm(new_embedding)
 
             self.recognition_stats['known_visitors'] += 1
+            face_data['status'] = 'known'  # Известный пользователь
             logger.debug(f"♻️  Подтвержден известный посетитель {visitor_id}")
             return visitor_id
 
@@ -363,6 +376,7 @@ class OptimizedTrassirCounter:
             track_data['visitor_id'] = visitor_id
             track_data['confirmed_at'] = timestamp
             self.recognition_stats['known_visitors'] += 1
+            face_data['status'] = 'known'  # Известный пользователь
             logger.info(f"👤 ОПОЗНАН известный посетитель {visitor_id}, схожесть: {similarity:.3f}")
             return visitor_id
         else:
@@ -371,9 +385,11 @@ class OptimizedTrassirCounter:
                 new_visitor_id = self._create_new_visitor(embedding, track_id)
                 if new_visitor_id:
                     self.recognition_stats['new_visitors'] += 1
+                    face_data['status'] = 'new'  # Новый пользователь в БД
                     logger.info(f"🆕 СОЗДАН новый посетитель {new_visitor_id}, схожесть с известными: {similarity:.3f}")
                 return new_visitor_id
             else:
+                face_data['status'] = 'analyzing'  # Анализ в процессе
                 logger.debug(f"⏳ Трек {track_id} ожидает подтверждения ({track_duration:.1f}s)")
 
         return None
@@ -434,6 +450,21 @@ class OptimizedTrassirCounter:
 
         return cap
 
+    def get_color_by_status(self, status):
+        """Получение цвета по статусу"""
+        return self.COLORS.get(status, (255, 255, 255))
+
+    def get_status_text(self, status):
+        """Получение текста по статусу"""
+        status_texts = {
+            'detected': 'DETECTED',
+            'tracking': 'TRACKING',
+            'analyzing': 'ANALYZING',
+            'known': 'KNOWN',
+            'new': 'NEW USER'
+        }
+        return status_texts.get(status, 'UNKNOWN')
+
     def process_frame_realtime(self, frame):
         """Обработка кадра с улучшенным трекингом"""
         current_time = time.time()
@@ -463,7 +494,7 @@ class OptimizedTrassirCounter:
             return frame, 0, 0
 
     def _apply_processing_result(self, frame, result, current_time):
-        """Применяет результаты обработки с трекингом"""
+        """Применяет результаты обработки с трекингом и цветовой индикацией"""
         processed_frame = frame.copy()
         processed_count = 0
 
@@ -474,27 +505,39 @@ class OptimizedTrassirCounter:
 
             if visitor_id:
                 self.save_visitor_visit(visitor_id, face_data['embedding'])
-                x, y, w, h = face_data['coords']
 
-                is_new = face_data['similarity'] <= self.similarity_threshold
-                color = (0, 0, 255) if is_new else (0, 255, 0)
-                status = "NEW" if is_new else "KNOWN"
+            x, y, w, h = face_data['coords']
+            status = face_data.get('status', 'detected')
 
-                cv2.rectangle(processed_frame, (x, y), (x + w, y + h), color, 3)
-                cv2.putText(processed_frame, f'{status}:{visitor_id}', (x, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-                cv2.putText(processed_frame, f'Sim:{face_data["similarity"]:.2f}',
-                            (x, y + h + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            # Получаем цвет и текст по статусу
+            color = self.get_color_by_status(status)
+            status_text = self.get_status_text(status)
 
-                processed_count += 1
+            # Отрисовка рамки с цветом статуса
+            cv2.rectangle(processed_frame, (x, y), (x + w, y + h), color, 3)
+
+            # Текст статуса
+            cv2.putText(processed_frame, f'{status_text}', (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+            # ID пользователя (если есть)
+            if visitor_id:
+                cv2.putText(processed_frame, f'ID: {visitor_id}', (x, y + h + 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+            # Схожесть (для отладки)
+            cv2.putText(processed_frame, f'Sim: {face_data["similarity"]:.2f}',
+                        (x, y + h + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+            processed_count += 1
 
         self.log_recognition_stats()
 
         return processed_frame, result['detected_count'], processed_count
 
     def start_analysis(self, rtsp_url):
-        """Запуск анализа с нормальным размером GUI"""
-        logger.info("🚀 Запуск версии с нормальным GUI...")
+        """Запуск анализа с цветовой индикацией"""
+        logger.info("🚀 Запуск версии с цветовой индикацией статусов...")
 
         cap = self.setup_rtsp_camera(rtsp_url)
         if not cap.isOpened():
@@ -502,14 +545,19 @@ class OptimizedTrassirCounter:
 
         self.start_processing_thread()
 
-        logger.info("✅ Анализ запущен")
+        logger.info("✅ Анализ с цветовой индикацией запущен")
 
         # Создаем окно нормального размера
-        window_name = 'Trassir Visitor Analytics - NORMAL SIZE'
+        window_name = 'Trassir Analytics - COLOR CODED STATUS'
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-
-        # Устанавливаем начальный размер окна
         cv2.resizeWindow(window_name, 1280, 720)
+
+        # Легенда цветов
+        logger.info("🎨 ЛЕГЕНДА ЦВЕТОВ:")
+        logger.info("   🟢 ЗЕЛЕНЫЙ - Лицо обнаружено / Известный пользователь")
+        logger.info("   🟡 ЖЕЛТЫЙ - Создан трек, анализ в процессе")
+        logger.info("   🟠 ОРАНЖЕВЫЙ - Анализ схожести")
+        logger.info("   🔴 КРАСНЫЙ - Новый пользователь добавлен в БД")
 
         try:
             while True:
@@ -521,12 +569,11 @@ class OptimizedTrassirCounter:
 
                 processed_frame, detected, processed = self.process_frame_realtime(frame)
 
-                # Умное масштабирование только если изображение слишком большое
                 display_frame = self.resize_frame_for_display(processed_frame, target_width=1280)
 
-                # Статистика на экране с читаемыми размерами
+                # Статистика на экране
                 stats_text = [
-                    f"TRASSIR VISITOR ANALYTICS",
+                    f"COLOR CODED FACE STATUS",
                     f"Detected: {detected}",
                     f"Processed: {processed}",
                     f"Total in DB: {len(self.known_visitors_cache)}",
@@ -535,9 +582,9 @@ class OptimizedTrassirCounter:
                     f"Press 'q' to quit"
                 ]
 
-                # Фон для текста для лучшей читаемости
+                # Фон для текста
                 overlay = display_frame.copy()
-                cv2.rectangle(overlay, (0, 0), (450, 180), (0, 0, 0), -1)
+                cv2.rectangle(overlay, (0, 0), (500, 180), (0, 0, 0), -1)
                 cv2.addWeighted(overlay, 0.7, display_frame, 0.3, 0, display_frame)
 
                 for i, text in enumerate(stats_text):
@@ -579,7 +626,6 @@ def main():
     """Основная функция"""
     RTSP_URL = "rtsp://admin:admin@10.0.0.242:554/live/main"
 
-    # Простые настройки
     counter = OptimizedTrassirCounter(
         processing_interval=1.5,
         similarity_threshold=0.55,
