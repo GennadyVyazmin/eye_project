@@ -1,4 +1,4 @@
-# video_analytics_trassir_complete.py
+# video_analytics_trassir_adjusted.py
 import cv2
 import numpy as np
 import sqlite3
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 class ImprovedTrassirCounter:
     def __init__(self, processing_interval=1.0, similarity_threshold=0.65, tracking_threshold=0.50):
         """
-        Улучшенная версия с фильтрацией ложных срабатываний
+        Версия с ослабленными фильтрами для тестирования
         """
         self.conn = sqlite3.connect('visitors_trassir_improved.db', check_same_thread=False)
         self._init_database()
@@ -61,16 +61,16 @@ class ImprovedTrassirCounter:
         self.last_gallery_cleanup = time.time()
         self.photo_size = (120, 160)
 
-        # Фильтрация ложных срабатываний
+        # ОСЛАБЛЕННЫЕ фильтры для тестирования
         self.false_positive_filter = {
-            'min_face_ratio': 0.08,
-            'max_face_ratio': 0.40,
-            'min_aspect_ratio': 0.7,
-            'max_aspect_ratio': 1.4,
-            'min_brightness': 30,
-            'max_brightness': 220,
-            'edge_threshold': 50,
-            'required_confirmations': 3
+            'min_face_ratio': 0.02,  # СНИЖЕНО: было 0.08
+            'max_face_ratio': 0.60,  # ПОВЫШЕНО: было 0.40
+            'min_aspect_ratio': 0.5,  # СНИЖЕНО: было 0.7
+            'max_aspect_ratio': 2.0,  # ПОВЫШЕНО: было 1.4
+            'min_brightness': 20,  # СНИЖЕНО: было 30
+            'max_brightness': 240,  # ПОВЫШЕНО: было 220
+            'edge_threshold': 20,  # СНИЖЕНО: было 50
+            'required_confirmations': 2  # СНИЖЕНО: было 3
         }
 
         # Статистика
@@ -80,7 +80,8 @@ class ImprovedTrassirCounter:
             'rejected_detections': 0,
             'new_visitors': 0,
             'known_visitors': 0,
-            'frames_processed': 0
+            'frames_processed': 0,
+            'quality_rejections': defaultdict(int)
         }
         self.last_log_time = time.time()
 
@@ -109,7 +110,7 @@ class ImprovedTrassirCounter:
         self.fps_frame_count = 0
         self.current_fps = 0
 
-        logger.info("🎯 Улучшенная система инициализирована с фильтрацией ложных срабатываний")
+        logger.info("🎯 Система инициализирована с ОСЛАБЛЕННЫМИ фильтрами")
 
     def _create_directories(self):
         """Создание папок для хранения фото"""
@@ -157,12 +158,10 @@ class ImprovedTrassirCounter:
         logger.info(f"📡 Подключение к камере: {rtsp_url}")
         cap = cv2.VideoCapture(rtsp_url)
 
-        # Оптимизация для RTSP
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         cap.set(cv2.CAP_PROP_FPS, 15)
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'H264'))
 
-        # Пропускаем кадры для стабилизации
         for _ in range(10):
             cap.read()
 
@@ -178,7 +177,7 @@ class ImprovedTrassirCounter:
         return cap
 
     def analyze_face_quality(self, face_image, bbox, frame_size):
-        """Анализ качества обнаруженного лица"""
+        """Анализ качества обнаруженного лица с отладкой"""
         try:
             x, y, w, h = bbox
             frame_height, frame_width = frame_size
@@ -188,74 +187,97 @@ class ImprovedTrassirCounter:
             frame_area = frame_width * frame_height
             face_ratio = face_area / frame_area
 
+            logger.debug(f"📏 Размер лица: {w}x{h}, отношение: {face_ratio:.4f}")
+
             if face_ratio < self.false_positive_filter['min_face_ratio']:
-                return False, "Слишком маленькое лицо"
+                self.recognition_stats['quality_rejections']['small_size'] += 1
+                return False, f"Слишком маленькое лицо ({face_ratio:.4f} < {self.false_positive_filter['min_face_ratio']})"
             if face_ratio > self.false_positive_filter['max_face_ratio']:
-                return False, "Слишком большое лицо"
+                self.recognition_stats['quality_rejections']['large_size'] += 1
+                return False, f"Слишком большое лицо ({face_ratio:.4f} > {self.false_positive_filter['max_face_ratio']})"
 
             # 2. Проверка соотношения сторон
             aspect_ratio = w / h
+            logger.debug(f"⚖️ Соотношение сторон: {aspect_ratio:.2f}")
+
             if aspect_ratio < self.false_positive_filter['min_aspect_ratio']:
-                return False, "Неправильное соотношение сторон (слишком узкое)"
+                self.recognition_stats['quality_rejections']['narrow'] += 1
+                return False, f"Слишком узкое ({aspect_ratio:.2f} < {self.false_positive_filter['min_aspect_ratio']})"
             if aspect_ratio > self.false_positive_filter['max_aspect_ratio']:
-                return False, "Неправильное соотношение сторон (слишком широкое)"
+                self.recognition_stats['quality_rejections']['wide'] += 1
+                return False, f"Слишком широкое ({aspect_ratio:.2f} > {self.false_positive_filter['max_aspect_ratio']})"
 
             # 3. Проверка яркости
             gray_face = cv2.cvtColor(face_image, cv2.COLOR_BGR2GRAY)
             brightness = np.mean(gray_face)
+            logger.debug(f"💡 Яркость: {brightness:.1f}")
+
             if brightness < self.false_positive_filter['min_brightness']:
-                return False, "Слишком темное лицо"
+                self.recognition_stats['quality_rejections']['dark'] += 1
+                return False, f"Слишком темное ({brightness:.1f} < {self.false_positive_filter['min_brightness']})"
             if brightness > self.false_positive_filter['max_brightness']:
-                return False, "Слишком светлое лицо"
+                self.recognition_stats['quality_rejections']['bright'] += 1
+                return False, f"Слишком светлое ({brightness:.1f} > {self.false_positive_filter['max_brightness']})"
 
             # 4. Проверка четкости (лапласиан)
             laplacian_var = cv2.Laplacian(gray_face, cv2.CV_64F).var()
+            logger.debug(f"🔍 Четкость (лапласиан): {laplacian_var:.1f}")
+
             if laplacian_var < self.false_positive_filter['edge_threshold']:
-                return False, "Нечеткое изображение"
+                self.recognition_stats['quality_rejections']['blurry'] += 1
+                return False, f"Нечеткое ({laplacian_var:.1f} < {self.false_positive_filter['edge_threshold']})"
 
             # 5. Проверка заполненности области
-            if np.std(gray_face) < 10:
-                return False, "Слишком однородная область"
+            contrast = np.std(gray_face)
+            logger.debug(f"🎨 Контраст: {contrast:.1f}")
 
-            return True, f"Качество OK (яркость: {brightness:.1f}, четкость: {laplacian_var:.1f})"
+            if contrast < 5:  # Еще более мягкий порог
+                self.recognition_stats['quality_rejections']['uniform'] += 1
+                return False, f"Слишком однородная область ({contrast:.1f})"
+
+            return True, f"✅ Качество OK (яркость: {brightness:.1f}, четкость: {laplacian_var:.1f}, контраст: {contrast:.1f})"
 
         except Exception as e:
+            self.recognition_stats['quality_rejections']['error'] += 1
             return False, f"Ошибка анализа качества: {e}"
 
     def detect_faces_robust(self, frame):
-        """Надежная детекция лиц с фильтрацией"""
+        """Надежная детекция лиц с ОСЛАБЛЕННОЙ фильтрацией"""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         frame_size = gray.shape
 
         all_faces = []
 
-        # Основной детектор
+        # ПЕРВЫЙ ПРОХОД: Детекция без фильтрации для отладки
         faces1 = self.face_cascade.detectMultiScale(
             gray,
-            scaleFactor=1.05,
-            minNeighbors=6,
-            minSize=(60, 60),
-            maxSize=(300, 300),
+            scaleFactor=1.1,  # Более агрессивный поиск
+            minNeighbors=4,  # Меньше соседей для большей чувствительности
+            minSize=(30, 30),  # Меньший минимальный размер
+            maxSize=(400, 400),
             flags=cv2.CASCADE_SCALE_IMAGE
         )
 
-        # Альтернативный детектор
         faces2 = self.alt_face_cascade.detectMultiScale(
             gray,
             scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(50, 50),
-            maxSize=(350, 350),
+            minNeighbors=3,  # Еще меньше соседей
+            minSize=(25, 25),  # Еще меньший размер
+            maxSize=(500, 500),
             flags=cv2.CASCADE_SCALE_IMAGE
         )
 
+        logger.info(f"🔍 СЫРАЯ детекция: основной {len(faces1)}, альтернативный {len(faces2)}")
+
         # Объединяем и фильтруем результаты
         face_set = set()
+        valid_count = 0
+        rejected_count = 0
 
         for faces in [faces1, faces2]:
             for (x, y, w, h) in faces:
                 # Группировка близких детекций
-                face_key = (x // 20, y // 20, w // 20, h // 20)
+                face_key = (x // 10, y // 10, w // 10, h // 10)  # Более точная группировка
                 if face_key in face_set:
                     continue
 
@@ -267,42 +289,46 @@ class ImprovedTrassirCounter:
 
                 if is_valid:
                     all_faces.append((x, y, w, h))
-                    logger.debug(f"✅ Валидное лицо: {w}x{h}, {quality_msg}")
+                    valid_count += 1
+                    logger.info(f"✅ Принято лицо {w}x{h}: {quality_msg}")
                 else:
-                    logger.debug(f"❌ Отклонено: {quality_msg}")
-                    self.recognition_stats['rejected_detections'] += 1
+                    rejected_count += 1
+                    logger.info(f"❌ Отклонено {w}x{h}: {quality_msg}")
 
-        logger.info(f"🔍 Детекция: валидных {len(all_faces)} из {len(faces1) + len(faces2)}")
+        logger.info(f"📊 ИТОГО: принято {valid_count}, отклонено {rejected_count}")
+        self.recognition_stats['rejected_detections'] += rejected_count
+
         return all_faces
 
-    def get_quality_embedding(self, face_image):
-        """Получение эмбеддинга с проверкой качества"""
+    def get_fast_embedding(self, face_image):
+        """Получение эмбеддинга с УПРОЩЕННОЙ проверкой"""
         try:
+            # Упрощенная предобработка
             face_resized = cv2.resize(face_image, (160, 160))
             face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
 
-            # Нормализация контраста
-            lab = cv2.cvtColor(face_rgb, cv2.COLOR_RGB2LAB)
-            l, a, b = cv2.split(lab)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            l_enhanced = clahe.apply(l)
-            lab_enhanced = cv2.merge([l_enhanced, a, b])
-            face_enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2RGB)
-
+            # Минимальная обработка для скорости
             result = DeepFace.represent(
-                face_enhanced,
+                face_rgb,
                 model_name='Facenet',
                 enforce_detection=False,
                 detector_backend='opencv',
-                align=True
+                align=False  # Отключаем выравнивание для скорости
             )
 
             embedding = np.array(result[0]['embedding'], dtype=np.float32)
 
-            if np.all(embedding == 0) or np.linalg.norm(embedding) < 0.1:
-                logger.warning("❌ Низкое качество эмбеддинга")
+            # ОЧЕНЬ мягкая проверка качества
+            if np.all(embedding == 0):
+                logger.warning("❌ Нулевой эмбеддинг")
                 return None
 
+            norm = np.linalg.norm(embedding)
+            if norm < 0.01:  # Очень мягкий порог
+                logger.warning(f"❌ Слишком маленькая норма эмбеддинга: {norm}")
+                return None
+
+            logger.debug(f"✅ Эмбеддинг получен, норма: {norm:.4f}")
             return embedding
 
         except Exception as e:
@@ -325,6 +351,7 @@ class ImprovedTrassirCounter:
             emb2_norm = embedding2 / norm2
 
             similarity = float(np.dot(emb1_norm, emb2_norm))
+            logger.debug(f"📐 Схожесть: {similarity:.3f}")
             return max(0.0, min(1.0, similarity))
 
         except Exception as e:
@@ -345,6 +372,7 @@ class ImprovedTrassirCounter:
                 best_similarity = similarity
                 best_match_id = visitor_id
 
+        logger.debug(f"🔍 Лучшее совпадение: ID {best_match_id}, схожесть {best_similarity:.3f}")
         return best_match_id, best_similarity
 
     def cleanup_old_gallery_entries(self):
@@ -424,7 +452,7 @@ class ImprovedTrassirCounter:
         return updated_faces
 
     def confirm_visitor_identity(self, track_id, face_data):
-        """Подтверждение идентичности посетителя с улучшенной логикой"""
+        """Подтверждение идентичности посетителя с УПРОЩЕННОЙ логикой"""
         track_data = self.face_tracks.get(track_id)
         if not track_data:
             return None
@@ -466,7 +494,7 @@ class ImprovedTrassirCounter:
         else:
             # Создаем нового посетителя
             track_duration = timestamp - track_data['created_at']
-            if track_duration > 3.0:
+            if track_duration > 2.0:  # Уменьшено время ожидания
                 new_visitor_id = self._create_new_visitor(embedding, face_image, track_id)
                 if new_visitor_id:
                     self.recognition_stats['new_visitors'] += 1
@@ -527,9 +555,9 @@ class ImprovedTrassirCounter:
             photo_clean = face_image.copy()
 
             height, width = photo_clean.shape[:2]
-            if width < 200:
-                scale = 200 / width
-                new_width = 200
+            if width < 100:  # Уменьшен минимальный размер
+                scale = 100 / width
+                new_width = 100
                 new_height = int(height * scale)
                 photo_clean = cv2.resize(photo_clean, (new_width, new_height), interpolation=cv2.INTER_LANCZOS4)
 
@@ -655,13 +683,18 @@ class ImprovedTrassirCounter:
     def log_recognition_stats(self):
         """Логирование статистики распознавания"""
         current_time = time.time()
-        if current_time - self.last_log_time >= 3.0:
+        if current_time - self.last_log_time >= 5.0:
             logger.info(f"📊 СТАТИСТИКА: Всего в базе: {len(self.known_visitors_cache)}, "
                         f"Активных треков: {len(self.face_tracks)}, "
                         f"В галерее: {len(self.current_visitors_gallery)}, "
                         f"Новых за сессию: {self.recognition_stats['new_visitors']}, "
                         f"Известных: {self.recognition_stats['known_visitors']}, "
                         f"Отклонено: {self.recognition_stats['rejected_detections']}")
+
+            # Детальная статистика по причинам отклонения
+            if self.recognition_stats['quality_rejections']:
+                logger.info(f"📋 ПРИЧИНЫ ОТКЛОНЕНИЯ: {dict(self.recognition_stats['quality_rejections'])}")
+
             self.last_log_time = current_time
 
     def start_processing_thread(self):
@@ -687,7 +720,7 @@ class ImprovedTrassirCounter:
                 continue
 
     def _process_frame_heavy(self, frame):
-        """Тяжелые операции обработки с улучшенной фильтрацией"""
+        """Тяжелые операции обработки с ОСЛАБЛЕННОЙ фильтрацией"""
         try:
             # Детекция лиц с фильтрацией
             faces = self.detect_faces_robust(frame)
@@ -696,13 +729,12 @@ class ImprovedTrassirCounter:
             if len(faces) > 0:
                 self.recognition_stats['total_detections'] += len(faces)
                 self.recognition_stats['valid_detections'] += len(faces)
-                logger.info(
-                    f"👥 ОБНАРУЖЕНО ЛИЦ: {len(faces)} (отклонено: {self.recognition_stats['rejected_detections']})")
+                logger.info(f"👥 ОБНАРУЖЕНО ЛИЦ: {len(faces)}")
 
                 for (x, y, w, h) in faces:
                     face_img = frame[y:y + h, x:x + w]
 
-                    embedding = self.get_quality_embedding(face_img)
+                    embedding = self.get_fast_embedding(face_img)
                     if embedding is not None:
                         visitor_id, similarity = self.find_best_match(embedding)
 
@@ -796,16 +828,16 @@ class ImprovedTrassirCounter:
 
     def start_analysis(self, rtsp_url):
         """Запуск анализа"""
-        logger.info("🚀 Запуск улучшенной версии с фильтрацией...")
+        logger.info("🚀 Запуск версии с ОСЛАБЛЕННЫМИ фильтрами...")
 
         cap = self.setup_rtsp_camera(rtsp_url)
         if not cap.isOpened():
             return
 
         self.start_processing_thread()
-        logger.info("✅ Улучшенный анализ запущен")
+        logger.info("✅ Анализ запущен с ОСЛАБЛЕННЫМИ фильтрами")
 
-        window_name = 'Trassir Analytics - IMPROVED'
+        window_name = 'Trassir Analytics - RELAXED FILTERS'
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_name, 1600, 900)
 
@@ -823,7 +855,7 @@ class ImprovedTrassirCounter:
 
                 # Статистика на экране
                 stats_text = [
-                    f"IMPROVED ANALYTICS WITH FILTERING",
+                    f"RELAXED FILTERS - TEST MODE",
                     f"Valid detections: {detected}",
                     f"Visitors processed: {processed}",
                     f"Active tracks: {len(self.face_tracks)}",
@@ -861,6 +893,8 @@ class ImprovedTrassirCounter:
             logger.info(f"   Новых создано: {self.recognition_stats['new_visitors']}")
             logger.info(f"   Известных обработано: {self.recognition_stats['known_visitors']}")
             logger.info(f"   Отклонено ложных срабатываний: {self.recognition_stats['rejected_detections']}")
+            if self.recognition_stats['quality_rejections']:
+                logger.info(f"   Детальная статистика отклонений: {dict(self.recognition_stats['quality_rejections'])}")
             logger.info("✅ Анализ завершен")
 
 
