@@ -1,475 +1,765 @@
-# video_analytics_trassir_low_latency.py
+# video_analytics_trassir_lightweight.py
 import cv2
 import numpy as np
 import sqlite3
 import datetime
 import time
-from deepface import DeepFace
 import logging
 import threading
 from queue import Queue
 import os
+import mediapipe as mp
 
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('face_analysis.log'),
+        logging.FileHandler('face_detection.log'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
 
-class LowLatencyCamera:
-    def __init__(self, rtsp_url, target_fps=5):
-        self.rtsp_url = rtsp_url
-        self.target_fps = target_fps
-        self.frame_interval = 1.0 / target_fps
-        self.cap = None
-        self.last_frame = None
-        self.last_frame_time = 0
-        self.frame_count = 0
-        self.running = False
-        self.thread = None
-        self.lock = threading.Lock()
-
-    def start(self):
-        """Запуск потока чтения кадров"""
-        logger.info(f"📡 Запуск камеры с низкой задержкой: {self.rtsp_url}")
-
-        # Параметры для минимальной задержки
-        self.cap = cv2.VideoCapture(self.rtsp_url)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        self.cap.set(cv2.CAP_PROP_FPS, self.target_fps)
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'H264'))
-
-        if not self.cap.isOpened():
-            logger.error("❌ Не удалось открыть камеру")
-            return False
-
-        # Очистка буфера камеры
-        for _ in range(10):
-            self.cap.read()
-
-        self.running = True
-        self.thread = threading.Thread(target=self._read_frames)
-        self.thread.daemon = True
-        self.thread.start()
-
-        logger.info("✅ Поток чтения кадров запущен")
-        return True
-
-    def _read_frames(self):
-        """Непрерывное чтение кадров в отдельном потоке"""
-        while self.running:
-            try:
-                ret, frame = self.cap.read()
-                if ret:
-                    with self.lock:
-                        self.last_frame = frame.copy()
-                        self.last_frame_time = time.time()
-                        self.frame_count += 1
-                else:
-                    logger.warning("📡 Потеря кадра")
-                    time.sleep(0.1)
-
-                # Небольшая пауза для снижения нагрузки
-                time.sleep(0.01)
-
-            except Exception as e:
-                logger.error(f"❌ Ошибка чтения кадра: {e}")
-                time.sleep(0.1)
-
-    def get_frame(self):
-        """Получение последнего кадра"""
-        with self.lock:
-            if self.last_frame is not None:
-                return self.last_frame.copy(), self.last_frame_time
-        return None, 0
-
-    def stop(self):
-        """Остановка камеры"""
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=2.0)
-        if self.cap:
-            self.cap.release()
-        logger.info("🛑 Камера остановлена")
-
-
-class LowLatencyCounter:
-    def __init__(self, processing_interval=2.0, similarity_threshold=0.65):
-        self.conn = sqlite3.connect('visitors_low_latency.db', check_same_thread=False)
+class LightweightTrassirCounter:
+    def __init__(self, processing_interval=1.0, tracking_threshold=0.6):
+        """
+        Облегченная версия без DeepFace, только MediaPipe + OpenCV
+        """
+        self.conn = sqlite3.connect('visitors_trassir_lightweight.db', check_same_thread=False)
         self._init_database()
 
         self.processing_interval = processing_interval
-        self.similarity_threshold = similarity_threshold
+        self.tracking_threshold = tracking_threshold
 
-        # Настройки камеры
-        self.target_fps = 5
-        self.frame_interval = 1.0 / self.target_fps
+        # Параметры фильтрации
+        self.min_face_size = 80
+        self.max_face_size = 400
+        self.min_confidence = 0.6
 
         # Цвета для индикации статусов
         self.COLORS = {
-            'detected': (0, 255, 0),  # Зеленый
-            'tracking': (255, 255, 0),  # Желтый
-            'known': (0, 255, 255),  # Голубой
-            'new': (0, 0, 255),  # Красный
+            'detected': (0, 255, 0),  # Зеленый - лицо обнаружено
+            'tracking': (255, 255, 0),  # Желтый - создан трек
+            'known': (0, 255, 255),  # Голубой - известный пользователь
+            'new': (0, 0, 255),  # Красный - новый пользователь в БД
+            'analyzing': (255, 165, 0),  # Оранжевый - анализ в процессе
+            'filtered': (128, 128, 128)  # Серый - отфильтровано
         }
 
         # Папки для хранения фото
-        self.photos_dir = "visitor_photos_low_latency"
+        self.photos_dir = "visitor_photos_lightweight"
+        self.current_session_dir = "current_session"
         self._create_directories()
 
-        # Система трекинга
+        # Трекинг состояния
+        self.last_processing_time = 0
+        self.known_visitors = {}  # Простая структура для хранения известных лиц
+        self.next_visitor_id = 1
+
+        # Система трекинга лиц
         self.face_tracks = {}
         self.next_track_id = 1
-        self.track_max_age = 2.0
+        self.track_max_age = 5.0
+
+        # Галерея текущих посетителей
+        self.current_visitors_gallery = {}
+        self.gallery_max_size = 8
+        self.photo_size = (120, 160)
 
         # Статистика
-        self.stats = {
-            'frames_processed': 0,
-            'faces_detected': 0,
-            'faces_recognized': 0,
-            'known_visitors': 0,
+        self.recognition_stats = {
+            'total_detections': 0,
             'new_visitors': 0,
-            'current_fps': 0.0,
-            'camera_fps': 0.0,
-            'processing_time': 0.0
+            'known_visitors': 0,
+            'frames_processed': 0,
+            'filtered_detections': 0
         }
+        self.last_log_time = time.time()
 
-        # Детектор лиц
-        self.face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-        )
+        # Инициализация MediaPipe
+        self.setup_mediapipe()
 
         # Для расчета FPS
-        self.fps_counter = 0
-        self.fps_timer = time.time()
+        self.fps_start_time = time.time()
+        self.fps_frame_count = 0
+        self.current_fps = 0
 
-        # Кэш
-        self.known_visitors_cache = {}
-        self.embedding_cache = {}
-        self._load_known_visitors()
+        logger.info("🎯 Облегченная система инициализирована (только MediaPipe)")
 
-        logger.info("🚀 Система с низкой задержкой инициализирована")
+    def setup_mediapipe(self):
+        """Инициализация MediaPipe"""
+        try:
+            self.mp_face_detection = mp.solutions.face_detection
+            self.mp_drawing = mp.solutions.drawing_utils
+            self.face_detection = self.mp_face_detection.FaceDetection(
+                model_selection=0,  # 0 для ближних, 1 для дальних лиц
+                min_detection_confidence=0.5
+            )
+            logger.info("✅ MediaPipe инициализирован для детекции лиц")
+        except Exception as e:
+            logger.error(f"❌ Ошибка инициализации MediaPipe: {e}")
+            raise
 
     def _create_directories(self):
+        """Создание папок для хранения фото"""
         os.makedirs(self.photos_dir, exist_ok=True)
+        os.makedirs(os.path.join(self.photos_dir, self.current_session_dir), exist_ok=True)
+        logger.info(f"📁 Созданы папки для фото: {self.photos_dir}")
 
     def _init_database(self):
+        """Инициализация базы данных"""
         cursor = self.conn.cursor()
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS visitors (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                face_embedding BLOB,
                 first_seen TIMESTAMP,
                 last_seen TIMESTAMP,
                 visit_count INTEGER DEFAULT 1,
-                photo_path TEXT
+                last_updated TIMESTAMP,
+                photo_path TEXT,
+                track_features BLOB
             )
         ''')
         self.conn.commit()
 
-    def _load_known_visitors(self):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT id, face_embedding FROM visitors")
-        for visitor_id, embedding_blob in cursor.fetchall():
-            if embedding_blob:
-                try:
-                    embedding = np.frombuffer(embedding_blob, dtype=np.float32)
-                    self.known_visitors_cache[visitor_id] = embedding
-                except Exception as e:
-                    logger.warning(f"Ошибка загрузки посетителя {visitor_id}: {e}")
-        logger.info(f"📊 Загружено посетителей: {len(self.known_visitors_cache)}")
+    def detect_faces_mediapipe(self, frame):
+        """Детекция лиц с использованием MediaPipe"""
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.face_detection.process(rgb_frame)
 
-    def setup_camera_ultra_low_latency(self, rtsp_url):
-        """Настройка камеры с ультра-низкой задержкой"""
-        camera = LowLatencyCamera(rtsp_url, self.target_fps)
-        if camera.start():
-            # Ждем получения первых кадров
-            for _ in range(20):  # 20 попыток
-                frame, _ = camera.get_frame()
-                if frame is not None:
-                    logger.info(f"✅ Камера готова. Разрешение: {frame.shape[1]}x{frame.shape[0]}")
-                    return camera
-                time.sleep(0.1)
-        return None
+        faces = []
+        if results.detections:
+            for detection in results.detections:
+                bbox = detection.location_data.relative_bounding_box
+                h, w = frame.shape[:2]
 
-    def detect_faces_ultra_fast(self, frame):
-        """Сверхбыстрая детекция лиц"""
+                x = int(bbox.xmin * w)
+                y = int(bbox.ymin * h)
+                width = int(bbox.width * w)
+                height = int(bbox.height * h)
+
+                confidence = detection.score[0]
+
+                # Фильтрация по уверенности и размеру
+                if (confidence >= self.min_confidence and
+                        width >= self.min_face_size and height >= self.min_face_size and
+                        width <= self.max_face_size and height <= self.max_face_size):
+
+                    # Дополнительная проверка на валидность
+                    if self.is_valid_face_region(frame, x, y, width, height):
+                        faces.append({
+                            'coords': (x, y, width, height),
+                            'confidence': confidence,
+                            'keypoints': detection.location_data.relative_keypoints
+                        })
+
+        return faces
+
+    def is_valid_face_region(self, frame, x, y, w, h):
+        """Проверка валидности региона лица"""
+        h_total, w_total = frame.shape[:2]
+
+        # Проверка выхода за границы
+        if x < 0 or y < 0 or x + w > w_total or y + h > h_total:
+            return False
+
+        # Проверка размера (относительно размера кадра)
+        if w < w_total * 0.05 or h < h_total * 0.05:  # Слишком маленький
+            return False
+        if w > w_total * 0.4 or h > h_total * 0.4:  # Слишком большой
+            return False
+
+        return True
+
+    def validate_human_features(self, face_image):
+        """Проверка что обнаруженный объект имеет характеристики человека"""
+        if face_image.size == 0:
+            return False
+
+        h, w = face_image.shape[:2]
+
+        # Проверка размера
+        if w < 50 or h < 50 or w > 400 or h > 400:
+            return False
+
         try:
-            # Минимальный ресайз для скорости
-            if frame.shape[1] > 800:
-                small_frame = cv2.resize(frame, (800, int(800 * frame.shape[0] / frame.shape[1])))
-            else:
-                small_frame = frame
+            # Проверка цветового распределения (кожа человека)
+            hsv = cv2.cvtColor(face_image, cv2.COLOR_BGR2HSV)
 
-            gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+            # Маска для цветов кожи
+            skin_lower = np.array([0, 20, 70], dtype=np.uint8)
+            skin_upper = np.array([20, 255, 255], dtype=np.uint8)
+            skin_mask = cv2.inRange(hsv, skin_lower, skin_upper)
 
-            faces = self.face_cascade.detectMultiScale(
-                gray,
-                scaleFactor=1.1,
-                minNeighbors=3,
-                minSize=(80, 80),  # Увеличили для скорости
-                maxSize=(400, 400),
-                flags=cv2.CASCADE_SCALE_IMAGE
-            )
+            # Процент пикселей кожи
+            skin_ratio = np.sum(skin_mask > 0) / (w * h)
 
-            # Масштабируем координаты
-            scale_x = frame.shape[1] / small_frame.shape[1]
-            scale_y = frame.shape[0] / small_frame.shape[0]
+            # Для лиц обычно 15-50% пикселей соответствуют цвету кожи
+            return 0.1 < skin_ratio < 0.7
+        except:
+            return True  # Если не удалось проверить, даем шанс
 
-            scaled_faces = []
-            for (x, y, w, h) in faces:
-                scaled_faces.append((
-                    int(x * scale_x),
-                    int(y * scale_y),
-                    int(w * scale_x),
-                    int(h * scale_y)
-                ))
-
-            return scaled_faces
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка детекции: {e}")
-            return []
-
-    def get_embedding_fast(self, face_image):
-        """Быстрое получение эмбеддинга"""
+    def extract_simple_features(self, face_image):
+        """Извлечение простых признаков для трекинга без DeepFace"""
         try:
-            img_hash = hash(face_image.tobytes())
-            if img_hash in self.embedding_cache:
-                return self.embedding_cache[img_hash]
+            # Ресайз для единообразия
+            resized = cv2.resize(face_image, (64, 64))
 
-            face_resized = cv2.resize(face_image, (160, 160))
-            face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
+            # Конвертация в grayscale
+            gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
 
-            result = DeepFace.represent(
-                face_rgb,
-                model_name='Facenet',
-                enforce_detection=False,
-                detector_backend='skip',
-                align=False
-            )
+            # Гистограмма градиентов (упрощенная версия)
+            gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0)
+            gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1)
 
-            embedding = np.array(result[0]['embedding'], dtype=np.float32)
+            mag, ang = cv2.cartToPolar(gx, gy)
 
-            # Кэширование
-            if len(self.embedding_cache) > 50:
-                self.embedding_cache.clear()
-            self.embedding_cache[img_hash] = embedding
+            # Упрощенные признаки: средняя яркость, контраст, гистограмма
+            features = []
+            features.append(np.mean(gray))  # Средняя яркость
+            features.append(np.std(gray))  # Контраст
+            features.extend(np.histogram(gray, bins=8)[0])  # Гистограмма
 
-            return embedding
+            # Нормализация
+            features = np.array(features, dtype=np.float32)
+            if np.linalg.norm(features) > 0:
+                features = features / np.linalg.norm(features)
 
+            return features
         except Exception as e:
+            logger.warning(f"Ошибка извлечения признаков: {e}")
             return None
 
-    def update_face_tracking(self, faces, current_time):
-        """Быстрое обновление трекинга"""
-        active_tracks = {}
+    def calculate_feature_similarity(self, features1, features2):
+        """Расчет схожести на основе простых признаков"""
+        if features1 is None or features2 is None:
+            return 0.0
 
-        # Очистка старых треков
-        for track_id in list(self.face_tracks.keys()):
-            if current_time - self.face_tracks[track_id]['last_seen'] > self.track_max_age:
-                del self.face_tracks[track_id]
+        try:
+            # Косинусная схожесть
+            similarity = np.dot(features1, features2)
+            return max(0.0, min(1.0, similarity))
+        except:
+            return 0.0
 
-        # Обновление треков
-        for face_bbox in faces:
-            x, y, w, h = face_bbox
-            face_center = (x + w // 2, y + h // 2)
+    def update_face_tracking(self, current_faces, timestamp):
+        """Обновление трекинга лиц между кадрами"""
+        updated_faces = []
+
+        for face_data in current_faces:
+            features = face_data['features']
+            coords = face_data['coords']
+            face_image = face_data['face_image']
 
             best_track_id = None
-            best_distance = float('inf')
+            best_similarity = 0.0
 
-            for track_id, track_info in self.face_tracks.items():
-                if current_time - track_info['last_seen'] > 1.0:
-                    continue
+            # Удаляем старые треки
+            for track_id in list(self.face_tracks.keys()):
+                if timestamp - self.face_tracks[track_id]['last_seen'] > self.track_max_age:
+                    logger.debug(f"🗑️ Удален старый трек {track_id}")
+                    del self.face_tracks[track_id]
 
-                last_center = track_info['last_center']
-                distance = np.sqrt((face_center[0] - last_center[0]) ** 2 +
-                                   (face_center[1] - last_center[1]) ** 2)
-
-                max_distance = min(w, h) * 1.5
-
-                if distance < best_distance and distance < max_distance:
-                    best_distance = distance
+            # Ищем совпадение с существующими треками
+            for track_id, track_data in self.face_tracks.items():
+                similarity = self.calculate_feature_similarity(features, track_data['features'])
+                if similarity > best_similarity and similarity > self.tracking_threshold:
+                    best_similarity = similarity
                     best_track_id = track_id
 
             if best_track_id is not None:
+                # Обновляем существующий трек
                 self.face_tracks[best_track_id].update({
-                    'last_seen': current_time,
-                    'last_center': face_center,
-                    'bbox': face_bbox,
-                    'confirmed_count': self.face_tracks[best_track_id].get('confirmed_count', 0) + 1
+                    'features': features,
+                    'last_seen': timestamp,
+                    'coords': coords,
+                    'face_image': face_image
                 })
-                active_tracks[best_track_id] = self.face_tracks[best_track_id]
+                face_data['track_id'] = best_track_id
+                face_data['visitor_id'] = self.face_tracks[best_track_id].get('visitor_id')
+                face_data['status'] = 'tracking'
+                face_data['similarity'] = best_similarity
+                logger.debug(f"🔄 Обновлен трек {best_track_id}, схожесть: {best_similarity:.3f}")
             else:
+                # Создаем новый трек
                 track_id = self.next_track_id
                 self.next_track_id += 1
-
                 self.face_tracks[track_id] = {
-                    'first_seen': current_time,
-                    'last_seen': current_time,
-                    'last_center': face_center,
-                    'bbox': face_bbox,
-                    'confirmed_count': 1,
-                    'status': 'detected'
+                    'features': features,
+                    'last_seen': timestamp,
+                    'coords': coords,
+                    'face_image': face_image,
+                    'visitor_id': None,
+                    'created_at': timestamp
                 }
-                active_tracks[track_id] = self.face_tracks[track_id]
+                face_data['track_id'] = track_id
+                face_data['status'] = 'tracking'
+                face_data['similarity'] = 0.0
+                logger.info(f"🎯 Создан новый трек {track_id}")
 
-        return active_tracks
+            updated_faces.append(face_data)
 
-    def process_frame_low_latency(self, frame):
-        """Обработка кадра с минимальной задержкой"""
-        start_time = time.time()
-        current_time = start_time
+        return updated_faces
+
+    def confirm_visitor_identity(self, track_id, face_data):
+        """Подтверждение идентичности посетителя"""
+        track_data = self.face_tracks.get(track_id)
+        if not track_data:
+            return None
+
+        features = face_data['features']
+        face_image = face_data['face_image']
+        timestamp = time.time()
+
+        # Если уже есть visitor_id, обновляем его
+        if track_data['visitor_id']:
+            visitor_id = track_data['visitor_id']
+            self.recognition_stats['known_visitors'] += 1
+            face_data['status'] = 'known'
+
+            # Обновляем галерею
+            self.update_visitor_gallery(visitor_id, face_image, 'known')
+
+            logger.debug(f"♻️  Подтвержден известный посетитель {visitor_id}")
+            return visitor_id
+
+        # Ищем лучшего кандидата среди известных
+        visitor_id, similarity = self.find_best_match(features)
+
+        if similarity > 0.7:  # Более высокий порог для простых признаков
+            # Подтверждаем существующего посетителя
+            track_data['visitor_id'] = visitor_id
+            track_data['confirmed_at'] = timestamp
+            self.recognition_stats['known_visitors'] += 1
+            face_data['status'] = 'known'
+
+            # Обновляем галерею
+            self.update_visitor_gallery(visitor_id, face_image, 'known')
+
+            logger.info(f"👤 ОПОЗНАН известный посетитель {visitor_id}, схожесть: {similarity:.3f}")
+            return visitor_id
+        else:
+            # Ждем подтверждения для нового посетителя
+            track_duration = timestamp - track_data['created_at']
+            if track_duration > 3.0:  # Увеличили время для более надежного трекинга
+                new_visitor_id = self._create_new_visitor(features, face_image, track_id)
+                if new_visitor_id:
+                    self.recognition_stats['new_visitors'] += 1
+                    face_data['status'] = 'new'
+
+                    # Сохраняем фото и обновляем галерею
+                    self.update_visitor_gallery(new_visitor_id, face_image, 'new')
+
+                    logger.info(f"🆕 СОЗДАН новый посетитель {new_visitor_id}")
+                return new_visitor_id
+            else:
+                face_data['status'] = 'analyzing'
+                logger.debug(f"⏳ Трек {track_id} ожидает подтверждения ({track_duration:.1f}s)")
+
+        return None
+
+    def find_best_match(self, features):
+        """Поиск лучшего совпадения среди известных посетителей"""
+        if features is None:
+            return None, 0.0
+
+        best_match_id = None
+        best_similarity = 0.0
+
+        for visitor_id, visitor_data in self.known_visitors.items():
+            similarity = self.calculate_feature_similarity(features, visitor_data['features'])
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_match_id = visitor_id
+
+        return best_match_id, best_similarity
+
+    def _create_new_visitor(self, features, face_image, track_id):
+        """Создание нового посетителя"""
+        cursor = self.conn.cursor()
+        now = datetime.datetime.now()
+
+        visitor_id = None
+        try:
+            # Сохраняем фото
+            photo_path = self.save_visitor_photo(face_image, "temp")
+
+            # Создаем запись в базе
+            features_blob = features.astype(np.float32).tobytes()
+            cursor.execute(
+                """INSERT INTO visitors (first_seen, last_seen, visit_count, 
+                   last_updated, photo_path, track_features) 
+                   VALUES (?, ?, 1, ?, ?, ?)""",
+                (now, now, now, photo_path, features_blob)
+            )
+            visitor_id = cursor.lastrowid
+
+            # Обновляем путь к фото с правильным ID
+            final_photo_path = self.save_visitor_photo(face_image, visitor_id)
+            cursor.execute(
+                "UPDATE visitors SET photo_path = ? WHERE id = ?",
+                (final_photo_path, visitor_id)
+            )
+
+            # Сохраняем в памяти
+            self.known_visitors[visitor_id] = {
+                'features': features,
+                'photo_path': final_photo_path,
+                'first_seen': now
+            }
+
+            self.conn.commit()
+
+            # Удаляем временное фото
+            if os.path.exists(photo_path):
+                os.remove(photo_path)
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания посетителя: {e}")
+            self.conn.rollback()
+            return None
+
+        if track_id in self.face_tracks:
+            self.face_tracks[track_id]['visitor_id'] = visitor_id
+
+        return visitor_id
+
+    def save_visitor_photo(self, face_image, visitor_id):
+        """Сохранение фото посетителя"""
+        try:
+            photo_clean = face_image.copy()
+
+            height, width = photo_clean.shape[:2]
+            if width < 200:
+                scale = 200 / width
+                new_width = 200
+                new_height = int(height * scale)
+                photo_clean = cv2.resize(photo_clean, (new_width, new_height), interpolation=cv2.INTER_LANCZOS4)
+
+            filename = f"visitor_{visitor_id}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            filepath = os.path.join(self.photos_dir, filename)
+            session_filepath = os.path.join(self.photos_dir, self.current_session_dir, filename)
+
+            cv2.imwrite(filepath, photo_clean)
+            cv2.imwrite(session_filepath, photo_clean)
+
+            logger.info(f"📸 Сохранено фото посетителя {visitor_id}")
+            return filepath
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения фото: {e}")
+            return ""
+
+    def update_visitor_gallery(self, visitor_id, face_image, status):
+        """Обновление галереи текущих посетителей"""
+        try:
+            gallery_photo = face_image.copy()
+
+            border_color = self.COLORS.get(status, (255, 255, 255))
+            gallery_photo = cv2.copyMakeBorder(
+                gallery_photo, 5, 25, 5, 5, cv2.BORDER_CONSTANT, value=border_color
+            )
+
+            status_text = self.get_status_text(status)
+            cv2.putText(gallery_photo, f"ID: {visitor_id}", (10, gallery_photo.shape[0] - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, border_color, 1)
+
+            gallery_photo = cv2.resize(gallery_photo, self.photo_size, interpolation=cv2.INTER_AREA)
+
+            self.current_visitors_gallery[visitor_id] = {
+                'photo': gallery_photo,
+                'last_seen': time.time(),
+                'status': status
+            }
+
+            if len(self.current_visitors_gallery) > self.gallery_max_size:
+                oldest_visitor = min(self.current_visitors_gallery.keys(),
+                                     key=lambda x: self.current_visitors_gallery[x]['last_seen'])
+                del self.current_visitors_gallery[oldest_visitor]
+
+        except Exception as e:
+            logger.error(f"Ошибка обновления галереи: {e}")
+
+    def get_status_text(self, status):
+        """Получение текста по статусу"""
+        status_texts = {
+            'detected': 'DETECTED',
+            'tracking': 'TRACKING',
+            'analyzing': 'ANALYZING',
+            'known': 'KNOWN',
+            'new': 'NEW USER',
+            'filtered': 'FILTERED'
+        }
+        return status_texts.get(status, 'UNKNOWN')
+
+    def get_color_by_status(self, status):
+        """Получение цвета по статусу"""
+        return self.COLORS.get(status, (255, 255, 255))
+
+    def create_gallery_display(self, main_frame):
+        """Создание галереи посетителей"""
+        try:
+            main_height, main_width = main_frame.shape[:2]
+
+            gallery_width = 300
+            gallery_panel = np.zeros((main_height, gallery_width, 3), dtype=np.uint8)
+
+            cv2.putText(gallery_panel, "CURRENT VISITORS", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(gallery_panel, f"Total: {len(self.current_visitors_gallery)}", (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+            if self.current_visitors_gallery:
+                visitor_ids = sorted(self.current_visitors_gallery.keys())
+                photos_per_column = 4
+                photo_width, photo_height = self.photo_size
+                margin = 10
+
+                for i, visitor_id in enumerate(visitor_ids):
+                    if i >= self.gallery_max_size:
+                        break
+
+                    visitor_data = self.current_visitors_gallery[visitor_id]
+                    row = i % photos_per_column
+                    col = i // photos_per_column
+
+                    x = margin + col * (photo_width + margin)
+                    y = 80 + row * (photo_height + margin)
+
+                    if y + photo_height < main_height and x + photo_width < gallery_width:
+                        gallery_panel[y:y + photo_height, x:x + photo_width] = visitor_data['photo']
+
+                        status_color = self.COLORS.get(visitor_data['status'], (255, 255, 255))
+                        cv2.circle(gallery_panel, (x + 10, y + 10), 5, status_color, -1)
+            else:
+                cv2.putText(gallery_panel, "No visitors", (50, main_height // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 1)
+                cv2.putText(gallery_panel, "in frame", (60, main_height // 2 + 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 1)
+
+            combined_frame = np.hstack([main_frame, gallery_panel])
+            return combined_frame
+
+        except Exception as e:
+            logger.error(f"Ошибка создания галереи: {e}")
+            return main_frame
+
+    def resize_frame_for_display(self, frame, target_width=1280):
+        """Изменение размера кадра для отображения"""
+        height, width = frame.shape[:2]
+
+        if width <= target_width:
+            return frame
+
+        ratio = target_width / width
+        new_width = target_width
+        new_height = int(height * ratio)
+
+        resized_frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+
+        return resized_frame
+
+    def log_recognition_stats(self):
+        """Логирование статистики распознавания"""
+        current_time = time.time()
+        if current_time - self.last_log_time >= 3.0:
+            logger.info(f"📊 СТАТИСТИКА: Всего в базе: {len(self.known_visitors)}, "
+                        f"Активных треков: {len(self.face_tracks)}, "
+                        f"В галерее: {len(self.current_visitors_gallery)}, "
+                        f"Новых за сессию: {self.recognition_stats['new_visitors']}, "
+                        f"Известных: {self.recognition_stats['known_visitors']}, "
+                        f"Отфильтровано: {self.recognition_stats['filtered_detections']}")
+            self.last_log_time = current_time
+
+    def process_frame(self, frame):
+        """Обработка кадра в реальном времени"""
+        current_time = time.time()
+
+        # Обновляем FPS
+        self.fps_frame_count += 1
+        if current_time - self.fps_start_time >= 1.0:
+            self.current_fps = self.fps_frame_count / (current_time - self.fps_start_time)
+            self.fps_frame_count = 0
+            self.fps_start_time = current_time
+
+        # Обрабатываем с интервалом
+        if current_time - self.last_processing_time < self.processing_interval:
+            return frame, 0, 0, 0
 
         # Детекция лиц
-        faces = self.detect_faces_ultra_fast(frame)
+        detected_faces = self.detect_faces_mediapipe(frame)
 
-        # Трекинг
-        active_tracks = self.update_face_tracking(faces, current_time)
+        processed_faces = []
+        filtered_count = 0
 
-        # Отрисовка
+        if detected_faces:
+            self.recognition_stats['total_detections'] += len(detected_faces)
+            logger.info(f"👥 ОБНАРУЖЕНО ОБЪЕКТОВ: {len(detected_faces)}")
+
+            for face_data in detected_faces:
+                x, y, w, h = face_data['coords']
+
+                face_img = frame[y:y + h, x:x + w]
+
+                # Проверка характеристик человека
+                if not self.validate_human_features(face_img):
+                    filtered_count += 1
+                    logger.debug("❌ Отфильтрован не-человеческий объект")
+                    continue
+
+                features = self.extract_simple_features(face_img)
+                if features is not None:
+                    processed_faces.append({
+                        'coords': (x, y, w, h),
+                        'features': features,
+                        'confidence': face_data['confidence'],
+                        'face_image': face_img,
+                        'status': 'detected'
+                    })
+
+        self.recognition_stats['filtered_detections'] += filtered_count
+
+        # Обновляем трекинг
+        tracked_faces = self.update_face_tracking(processed_faces, current_time)
+
+        # Отрисовка результатов
         processed_frame = frame.copy()
+        processed_count = 0
 
-        for track_id, track_info in active_tracks.items():
-            x, y, w, h = track_info['bbox']
-            status = track_info.get('status', 'detected')
-            color = self.COLORS[status]
+        for face_data in tracked_faces:
+            visitor_id = self.confirm_visitor_identity(face_data['track_id'], face_data)
 
-            # Отрисовка bounding box
-            cv2.rectangle(processed_frame, (x, y), (x + w, y + h), color, 2)
+            x, y, w, h = face_data['coords']
+            status = face_data.get('status', 'detected')
 
-            # Текст
-            label = f"ID:{track_id} {status}"
-            if track_info.get('visitor_id'):
-                label += f" V:{track_info['visitor_id']}"
+            color = self.get_color_by_status(status)
+            status_text = self.get_status_text(status)
 
-            cv2.putText(processed_frame, label, (x, y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            # Отрисовка рамки
+            cv2.rectangle(processed_frame, (x, y), (x + w, y + h), color, 3)
+            cv2.putText(processed_frame, f'{status_text}', (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-        # Обновление статистики
-        processing_time = time.time() - start_time
-        self.stats['processing_time'] = processing_time
-        self.stats['frames_processed'] += 1
-        self.stats['faces_detected'] += len(active_tracks)
+            if visitor_id:
+                cv2.putText(processed_frame, f'ID: {visitor_id}', (x, y + h + 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                if 'similarity' in face_data:
+                    cv2.putText(processed_frame, f'Sim: {face_data["similarity"]:.2f}',
+                                (x, y + h + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
-        return processed_frame, len(active_tracks)
+            processed_count += 1
 
-    def start_analysis_low_latency(self, rtsp_url):
-        """Запуск анализа с ультра-низкой задержкой"""
-        logger.info("🚀 Запуск режима УЛЬТРА-НИЗКОЙ ЗАДЕРЖКИ")
+        self.last_processing_time = current_time
+        self.log_recognition_stats()
 
-        # Настройка камеры
-        camera = self.setup_camera_ultra_low_latency(rtsp_url)
-        if not camera:
-            logger.error("❌ Не удалось инициализировать камеру")
+        return processed_frame, len(detected_faces), processed_count, filtered_count
+
+    def setup_rtsp_camera(self, rtsp_url):
+        """Настройка RTSP"""
+        logger.info(f"📡 Подключение к камере: {rtsp_url}")
+        cap = cv2.VideoCapture(rtsp_url)
+
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FPS, 15)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'H264'))
+
+        # Пропускаем кадры для стабилизации
+        for _ in range(10):
+            cap.read()
+
+        if cap.isOpened():
+            ret, test_frame = cap.read()
+            if ret:
+                logger.info(f"✅ Камера подключена. Разрешение: {test_frame.shape[1]}x{test_frame.shape[0]}")
+            else:
+                logger.error("❌ Камера не передает данные")
+        else:
+            logger.error("❌ Не удалось подключиться к камере")
+
+        return cap
+
+    def start_analysis(self, rtsp_url):
+        """Запуск анализа"""
+        logger.info("🚀 Запуск облегченной версии с MediaPipe...")
+
+        cap = self.setup_rtsp_camera(rtsp_url)
+        if not cap.isOpened():
             return
 
-        # Создание окна
-        window_name = 'Trassir - ULTRA LOW LATENCY'
+        logger.info("✅ Анализ запущен")
+
+        window_name = 'Trassir Analytics - LIGHTWEIGHT (MediaPipe only)'
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window_name, 1200, 900)
-
-        logger.info("✅ Система готова. Задержка должна быть < 500ms")
-
-        last_processing_time = 0
-        frame_counter = 0
+        cv2.resizeWindow(window_name, 1600, 900)
 
         try:
             while True:
-                current_time = time.time()
-
-                # Контроль FPS - обрабатываем каждые 200ms
-                if current_time - last_processing_time < self.frame_interval:
-                    time.sleep(0.001)  # Короткая пауза
+                ret, frame = cap.read()
+                if not ret:
+                    logger.warning("📡 Потеряно соединение с камерой...")
+                    time.sleep(2)
                     continue
 
-                last_processing_time = current_time
-
-                # Получение кадра от камеры
-                frame, frame_time = camera.get_frame()
-                if frame is None:
-                    continue
-
-                # Расчет задержки кадра
-                frame_delay = current_time - frame_time
-
-                # Обработка кадра
-                processed_frame, faces_count = self.process_frame_low_latency(frame)
-
-                # Обновление FPS
-                frame_counter += 1
-                if current_time - self.fps_timer >= 1.0:
-                    self.stats['current_fps'] = frame_counter / (current_time - self.fps_timer)
-                    self.stats['camera_fps'] = camera.frame_count / (current_time - self.fps_timer)
-                    camera.frame_count = 0
-                    frame_counter = 0
-                    self.fps_timer = current_time
-
-                # Подготовка к отображению
-                display_frame = processed_frame
-                if display_frame.shape[1] > 1200:
-                    display_frame = cv2.resize(display_frame,
-                                               (1200, int(1200 * display_frame.shape[0] / display_frame.shape[1])))
+                processed_frame, detected, processed, filtered = self.process_frame(frame)
+                display_frame = self.resize_frame_for_display(processed_frame, target_width=1280)
+                display_with_gallery = self.create_gallery_display(display_frame)
 
                 # Статистика на экране
                 stats_text = [
-                    f"ULTRA LOW LATENCY MODE",
-                    f"Camera FPS: {self.stats['camera_fps']:.1f} | UI FPS: {self.stats['current_fps']:.1f}",
-                    f"Frame delay: {frame_delay * 1000:.0f}ms | Process: {self.stats['processing_time'] * 1000:.1f}ms",
-                    f"Active faces: {faces_count} | Tracks: {len(self.face_tracks)}",
-                    f"Known: {self.stats['known_visitors']} | New: {self.stats['new_visitors']}",
-                    f"Press Q to quit"
+                    f"LIGHTWEIGHT ANALYTICS (MediaPipe)",
+                    f"Objects detected: {detected}",
+                    f"Faces processed: {processed}",
+                    f"Filtered: {filtered}",
+                    f"Active tracks: {len(self.face_tracks)}",
+                    f"In gallery: {len(self.current_visitors_gallery)}",
+                    f"FPS: {self.current_fps:.1f}",
+                    f"Press 'q' to quit"
                 ]
 
-                # Отрисовка статистики
+                overlay = display_with_gallery.copy()
+                cv2.rectangle(overlay, (0, 0), (500, 220), (0, 0, 0), -1)
+                cv2.addWeighted(overlay, 0.7, display_with_gallery, 0.3, 0, display_with_gallery)
+
                 for i, text in enumerate(stats_text):
-                    y_pos = 30 + i * 25
-                    cv2.rectangle(display_frame, (5, y_pos - 20), (550, y_pos + 5), (0, 0, 0), -1)
-                    cv2.putText(display_frame, text, (10, y_pos),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    color = (255, 255, 255)
+                    if "Filtered" in text and filtered > 0:
+                        color = (0, 255, 255)  # Желтый для фильтрованных объектов
+                    cv2.putText(display_with_gallery, text, (10, 30 + i * 25),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-                # Индикатор задержки
-                delay_color = (0, 255, 0) if frame_delay < 0.5 else (0, 255, 255) if frame_delay < 1.0 else (0, 0, 255)
-                cv2.putText(display_frame, f"LATENCY: {frame_delay * 1000:.0f}ms",
-                            (10, display_frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, delay_color, 2)
+                cv2.imshow(window_name, display_with_gallery)
 
-                cv2.imshow(window_name, display_frame)
-
-                # Обработка клавиш
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
+                if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
         except KeyboardInterrupt:
-            logger.info("⏹️ Остановка...")
+            logger.info("⏹️ Остановка по Ctrl+C...")
         finally:
-            camera.stop()
+            cap.release()
             cv2.destroyAllWindows()
             self.conn.close()
 
             logger.info(f"📊 ФИНАЛЬНАЯ СТАТИСТИКА:")
-            logger.info(f"   Средний FPS: {self.stats['current_fps']:.1f}")
-            logger.info(f"   Задержка обработки: {self.stats['processing_time'] * 1000:.1f}ms")
-            logger.info(f"   Обнаружено лиц: {self.stats['faces_detected']}")
+            logger.info(f"   Всего посетителей: {len(self.known_visitors)}")
+            logger.info(f"   Новых создано: {self.recognition_stats['new_visitors']}")
+            logger.info(f"   Известных обработано: {self.recognition_stats['known_visitors']}")
+            logger.info(f"   Отфильтровано объектов: {self.recognition_stats['filtered_detections']}")
             logger.info("✅ Анализ завершен")
 
 
 def main():
+    """Основная функция"""
     RTSP_URL = "rtsp://admin:admin@10.0.0.242:554/live/main"
 
-    counter = LowLatencyCounter(
-        processing_interval=2.0,
-        similarity_threshold=0.65
+    counter = LightweightTrassirCounter(
+        processing_interval=1.0,
+        tracking_threshold=0.6
     )
 
     try:
-        counter.start_analysis_low_latency(RTSP_URL)
+        counter.start_analysis(RTSP_URL)
     except Exception as e:
         logger.error(f"❌ Критическая ошибка: {e}")
 
